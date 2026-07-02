@@ -154,7 +154,7 @@ func TestScanCached(t *testing.T) {
 	cache.state = newDCState(dcUnchanged, cache)
 	cache.keys, err = NewKeyIndex(&cfg)
 	require.NoError(t, err)
-	cache.dir = "/tmp/jfstest_scan"
+	cache.dir = t.TempDir()
 	rawDir := filepath.Join(cache.dir, cacheDir)
 	if err := os.MkdirAll(rawDir, 0755); err != nil {
 		t.Fatalf("mkdir %s: %s", rawDir, err)
@@ -165,7 +165,6 @@ func TestScanCached(t *testing.T) {
 			_ = f.Close()
 		}
 	}
-	defer os.RemoveAll(rawDir)
 	cache.scanCached(true)
 	require.Equal(t, num, cache.keys.len())
 }
@@ -375,11 +374,9 @@ func shutdownStore(s *cacheStore) {
 
 func TestCacheManager(t *testing.T) {
 	conf := defaultConf
-	conf.CacheDir = "/tmp/diskCache0:/tmp/diskCache1:/tmp/diskCache2"
+	dir0, dir1, dir2 := t.TempDir(), t.TempDir(), t.TempDir()
+	conf.CacheDir = dir0 + ":" + dir1 + ":" + dir2
 	conf.AutoCreate = true
-	defer os.RemoveAll("/tmp/diskCache0")
-	defer os.RemoveAll("/tmp/diskCache1")
-	defer os.RemoveAll("/tmp/diskCache2")
 	manager := newCacheManager(&conf, nil, nil)
 	require.True(t, !manager.isEmpty())
 
@@ -514,7 +511,6 @@ func TestUnknownInodeStatsShouldNotMarkCacheAsRawFull(t *testing.T) {
 		m := new(cacheManagerMetrics)
 		m.initMetrics()
 		s := newCacheStore(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
-		defer shutdownStore(s)
 
 		require.Never(t, func() bool {
 			s.Lock()
@@ -658,9 +654,11 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 	conf := defaultConf
 	conf.CacheExpire = time.Hour
 	conf.CacheEviction = EvictionNone
+	conf.CacheScanInterval = -1
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
 	cache := newCacheStore(m, dir, 1<<30, 1000, 1, &conf, nil)
+	cache.scanned = true
 	key := "0_0_4"
 
 	PatchConvey("mock time.Now to avoid drift", t, func() {
@@ -676,5 +674,114 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 		require.NotNil(t, rc)
 		defer rc.Close()
 		require.Equal(t, uint32(fixedTime.Unix()), cache.keys.peekAtime(cache.getCacheKey(key)))
+	})
+}
+
+func newTestCacheStore(dir string, conf *Config, uploader func(key, path string, force bool) bool) *cacheStore {
+	keyIndex, _ := NewKeyIndex(conf)
+	c := &cacheStore{
+		dir:       dir,
+		mode:      0600,
+		capacity:  1 << 30,
+		freeRatio: conf.FreeSpace,
+		keys:      keyIndex,
+		pending:   make(chan pendingFile, 10),
+		pages:     make(map[string]*Page),
+		uploader:  uploader,
+		opTs:      make(map[time.Duration]func() error),
+		scanned:   true,
+	}
+	c.state = newDCState(dcNormal, c)
+	return c
+}
+
+func TestUploadStagingToFreeCalculation(t *testing.T) {
+	PatchConvey("uploadStaging should only upload enough blocks to satisfy freeRatio", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadedKeys []string
+		uploader := func(key, path string, force bool) bool {
+			uploadedKeys = append(uploadedKeys, key)
+			return true
+		}
+
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+		}
+
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 5000, 100000, 100000
+		}).Build()
+
+		s.uploadStaging()
+		uploaded := len(uploadedKeys)
+		require.LessOrEqual(t, uploaded, 5)
+		require.Greater(t, uploaded, 0, "should upload at least some blocks when disk is tight")
+	})
+}
+
+func TestUploadStagingInodeToFree(t *testing.T) {
+	PatchConvey("uploadStaging respects inode pressure", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadCount int
+		uploader := func(key, path string, force bool) bool {
+			uploadCount++
+			return true
+		}
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+		}
+
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 20000, 1000, 50
+		}).Build()
+		s.uploadStaging()
+		count := uploadCount
+		require.Greater(t, count, 0, "should upload blocks when inodes are tight")
+	})
+}
+
+func TestSpaceToFreeNoAction(t *testing.T) {
+	PatchConvey("uploadStaging does nothing when disk has enough space", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.CacheEviction = EvictionNone
+
+		var uploadCount int
+		uploader := func(key, path string, force bool) bool {
+			uploadCount++
+			return true
+		}
+
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+
+		for i := 0; i < 5; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix())})
+		}
+
+		// Mock: 20% free space, 20% free inodes - both above freeRatio (10%)
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return 100000, 20000, 100000, 20000
+		}).Build()
+
+		s.uploadStaging()
+		require.Equal(t, 0, uploadCount, "should not upload when disk has enough free space and inodes")
 	})
 }

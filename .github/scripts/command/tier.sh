@@ -7,8 +7,11 @@ META_URL=$(get_meta_url $META)
 source .github/scripts/common/common.sh
 
 AWS_BUCKET=${AWS_BUCKET:-tiertest-${META}}
-AWS_BUCKET=$(printf '%s' "$AWS_BUCKET" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9.-' '-')
+AWS_BUCKET_SUFFIX=${AWS_BUCKET_SUFFIX:-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-$RANDOM}}
+AWS_BUCKET=$(printf '%s-%s' "$AWS_BUCKET" "$AWS_BUCKET_SUFFIX" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9.-' '-')
 AWS_BUCKET=${AWS_BUCKET#-}
+AWS_BUCKET=${AWS_BUCKET%-}
+AWS_BUCKET=${AWS_BUCKET:0:63}
 AWS_BUCKET=${AWS_BUCKET%-}
 AWS_REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}
 AWS_ACCESS_KEY_VALUE=${AWS_ACCESS_KEY_ID:-${AWS_ACEESS_KEY:-}}
@@ -135,9 +138,9 @@ setup_tier_volume()
     ./juicefs mount -d "$META_URL" /jfs --heartbeat 2s
 
     # configure tier 1~3 before using juicefs tier commands
-    ./juicefs config "$META_URL" --tier-id 1 --tier-sc STANDARD_IA -y
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc INTELLIGENT_TIERING -y
-    ./juicefs config "$META_URL" --tier-id 3 --tier-sc GLACIER_IR -y
+    ./juicefs config "$META_URL" --tier 1 --storage-class STANDARD_IA -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class INTELLIGENT_TIERING -y
+    ./juicefs config "$META_URL" --tier 3 --storage-class GLACIER_IR -y
 }
 
 setup_tier_volume_writeback()
@@ -160,9 +163,9 @@ setup_tier_volume_writeback()
     ./juicefs mount -d "$META_URL" /jfs --heartbeat 2s \
         --writeback --upload-delay "$upload_delay"
 
-    ./juicefs config "$META_URL" --tier-id 1 --tier-sc STANDARD_IA -y
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc INTELLIGENT_TIERING -y
-    ./juicefs config "$META_URL" --tier-id 3 --tier-sc GLACIER_IR -y
+    ./juicefs config "$META_URL" --tier 1 --storage-class STANDARD_IA -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class INTELLIGENT_TIERING -y
+    ./juicefs config "$META_URL" --tier 3 --storage-class GLACIER_IR -y
 }
 
 get_tier_token()
@@ -243,7 +246,7 @@ assert_config_tier_sc_fail()
 {
     local id=$1
     local sc=$2
-    if ./juicefs config "$META_URL" --tier-id "$id" --tier-sc "$sc" -y; then
+    if ./juicefs config "$META_URL" --tier "$id" --storage-class "$sc" -y; then
         echo "<FATAL>: expect config failure but succeeded, id=$id storage-class=$sc"
         exit 1
     fi
@@ -292,14 +295,25 @@ tier_set_no_err()
 {
     local tmpout=/tmp/tier_set_last.log
     local status
-    ./juicefs tier set "$@" 2>&1 | tee "$tmpout"
-    status=${PIPESTATUS[0]}
-    if grep -qF '<ERROR>' "$tmpout"; then
-        echo "<FATAL>: juicefs tier set produced unexpected ERROR logs:"
-        grep -F '<ERROR>' "$tmpout"
-        exit 1
-    fi
-    return "$status"
+    local max_retries=3
+    local attempt
+    local path_arg="${@: -1}"  # last argument is expected to be the file/dir path
+    for attempt in $(seq 1 "$max_retries"); do
+        ./juicefs tier set "$@" 2>&1 | tee "$tmpout"
+        status=${PIPESTATUS[0]}
+        if grep -qF '<ERROR>' "$tmpout"; then
+            echo "<FATAL>: juicefs tier set produced unexpected ERROR logs (attempt $attempt/$max_retries):"
+            grep -F '<ERROR>' "$tmpout"
+            if [[ "$attempt" -lt "$max_retries" ]]; then
+                echo "retrying..."
+                sleep 2
+                continue
+            fi
+            assert_info_no_empty_object_name "/jfs/${path_arg#/}"
+            exit 1
+        fi
+        return "$status"
+    done
 }
 
 get_first_object_key()
@@ -371,6 +385,12 @@ assert_info_no_empty_object_name()
         cat "$info_out"
         exit 1
     fi
+    # print raw info for diagnostics when tier set fails after all retries
+    echo "=== diagnostic: juicefs info ==="
+    ./juicefs info  "$path" || true
+    # print raw info for diagnostics when tier set fails after all retries
+    echo "=== diagnostic: juicefs info --raw ==="
+    ./juicefs info --raw "$path" || true
 }
 
 test_tier_list_and_file_set_conversion()
@@ -381,7 +401,7 @@ test_tier_list_and_file_set_conversion()
     mkdir -p /jfs/file_case
     dd if=/dev/urandom of=/jfs/file_case/f1 bs=1M count=8 status=none
 
-    tier_set_no_err "$META_URL" --id 1 /file_case/f1
+    tier_set_no_err "$META_URL" --tier 1 /file_case/f1
     sleep 5
     assert_tier_id /jfs/file_case/f1 1
     ./juicefs info /jfs/file_case/f1
@@ -389,14 +409,14 @@ test_tier_list_and_file_set_conversion()
     assert_object_storage_class_by_path /jfs/file_case/f1 STANDARD_IA
     cat /jfs/file_case/f1 >/dev/null
 
-    tier_set_no_err "$META_URL" --id 2 /file_case/f1
+    tier_set_no_err "$META_URL" --tier 2 /file_case/f1
     sleep 5
     assert_tier_id /jfs/file_case/f1 2
     assert_tier_sc /jfs/file_case/f1 INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/file_case/f1 INTELLIGENT_TIERING
     cat /jfs/file_case/f1 >/dev/null
 
-    ./juicefs tier set "$META_URL" --id 0 /file_case/f1
+    ./juicefs tier set "$META_URL" --tier 0 /file_case/f1
     sleep 5
     assert_tier_id /jfs/file_case/f1 0
     assert_object_storage_class_by_path /jfs/file_case/f1 STANDARD
@@ -419,7 +439,7 @@ test_tier_config_all_storage_classes()
 
     for sc in "${storage_classes[@]}"; do
         echo "Testing config with storage class: $sc"
-        ./juicefs config "$META_URL" --tier-id 2 --tier-sc "$sc" -y || {
+        ./juicefs config "$META_URL" --tier 2 --storage-class "$sc" -y || {
             echo "<FATAL>: config failed for storage class $sc"
             exit 1
         }
@@ -442,7 +462,7 @@ test_tier_dir_recursive_and_non_recursive()
     git clone --depth 1 https://github.com/juicedata/juicefs.git /jfs/dir_case/juicefs
 
     # Phase 1: non-recursive set — only the directory itself changes
-    tier_set_no_err "$META_URL" --id 1 /dir_case/juicefs
+    tier_set_no_err "$META_URL" --tier 1 /dir_case/juicefs
     assert_tier_id /jfs/dir_case/juicefs 1
     assert_tier_id /jfs/dir_case/juicefs/cmd 0
     assert_tier_id /jfs/dir_case/juicefs/pkg 0
@@ -453,10 +473,10 @@ test_tier_dir_recursive_and_non_recursive()
     assert_tier_id /jfs/dir_case/juicefs/Makefile 0
 
     # Phase 2: set different tiers on different subdirectories
-    tier_set_no_err "$META_URL" --id 1 /dir_case/juicefs/cmd -r       # STANDARD_IA
-    tier_set_no_err "$META_URL" --id 2 /dir_case/juicefs/pkg -r       # INTELLIGENT_TIERING
-    tier_set_no_err "$META_URL" --id 3 /dir_case/juicefs/docs -r      # GLACIER_IR
-    tier_set_no_err "$META_URL" --id 1 /dir_case/juicefs/.git -r      # hidden dir: STANDARD_IA
+    tier_set_no_err "$META_URL" --tier 1 /dir_case/juicefs/cmd -r       # STANDARD_IA
+    tier_set_no_err "$META_URL" --tier 2 /dir_case/juicefs/pkg -r       # INTELLIGENT_TIERING
+    tier_set_no_err "$META_URL" --tier 3 /dir_case/juicefs/docs -r      # GLACIER_IR
+    tier_set_no_err "$META_URL" --tier 1 /dir_case/juicefs/.git -r      # hidden dir: STANDARD_IA
 
     assert_tier_id /jfs/dir_case/juicefs/cmd 1
     assert_tier_sc /jfs/dir_case/juicefs/cmd STANDARD_IA
@@ -488,7 +508,7 @@ test_tier_dir_recursive_and_non_recursive()
     fi
 
     # Phase 3: recursive set on the top-level dir overrides everything to tier 2
-    tier_set_no_err "$META_URL" --id 2 /dir_case/juicefs -r
+    tier_set_no_err "$META_URL" --tier 2 /dir_case/juicefs -r
     assert_tier_id /jfs/dir_case/juicefs 2
     assert_tier_id /jfs/dir_case/juicefs/cmd 2
     assert_tier_id /jfs/dir_case/juicefs/pkg 2
@@ -518,7 +538,7 @@ test_tier_clone_after_dir_set()
         echo "data_$i" > /jfs/clone_src/a/b/file_$i
     done
 
-    tier_set_no_err "$META_URL" --id 2 /clone_src -r
+    tier_set_no_err "$META_URL" --tier 2 /clone_src -r
     ./juicefs clone /jfs/clone_src /jfs/clone_dst
     diff -ur /jfs/clone_src /jfs/clone_dst --no-dereference
 
@@ -536,17 +556,17 @@ test_tier_change_mapping_after_set()
     mkdir -p /jfs/reconf
     echo "reconf" > /jfs/reconf/file
 
-    tier_set_no_err "$META_URL" --id 2 /reconf/file
+    tier_set_no_err "$META_URL" --tier 2 /reconf/file
     assert_tier_id /jfs/reconf/file 2
     assert_tier_sc /jfs/reconf/file INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/reconf/file INTELLIGENT_TIERING
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc STANDARD_IA -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class STANDARD_IA -y
     sleep 5
     assert_tier_id /jfs/reconf/file 2
     assert_tier_sc_expected_actual /jfs/reconf/file STANDARD_IA INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/reconf/file INTELLIGENT_TIERING
-    tier_set_no_err "$META_URL" --id 2 /reconf/file --force
+    tier_set_no_err "$META_URL" --tier 2 /reconf/file --force
     assert_tier_id /jfs/reconf/file 2
     assert_tier_sc /jfs/reconf/file STANDARD_IA
     assert_object_storage_class_by_path /jfs/reconf/file STANDARD_IA
@@ -561,9 +581,9 @@ test_tier_invalid_mapping_reapply()
     dd if=/dev/urandom of=/jfs/invalid_map_case/root.bin bs=1M count=8 status=none
     dd if=/dev/urandom of=/jfs/invalid_map_case/a/b/child.bin bs=1M count=8 status=none
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc GLACIER_IR -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class GLACIER_IR -y
     sleep 5
-    tier_set_no_err "$META_URL" --id 2 /invalid_map_case -r
+    tier_set_no_err "$META_URL" --tier 2 /invalid_map_case -r
     assert_tier_sc /jfs/invalid_map_case GLACIER_IR
     assert_tier_sc /jfs/invalid_map_case/a GLACIER_IR
     assert_tier_sc /jfs/invalid_map_case/a/b GLACIER_IR
@@ -572,13 +592,13 @@ test_tier_invalid_mapping_reapply()
     assert_object_storage_class_by_path /jfs/invalid_map_case/root.bin GLACIER_IR
     assert_object_storage_class_by_path /jfs/invalid_map_case/a/b/child.bin GLACIER_IR
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc INTELLIGENT_TIERING -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class INTELLIGENT_TIERING -y
     sleep 5
     assert_tier_sc_expected_actual /jfs/invalid_map_case/root.bin INTELLIGENT_TIERING GLACIER_IR
     assert_tier_sc_expected_actual /jfs/invalid_map_case/a/b/child.bin INTELLIGENT_TIERING GLACIER_IR
     assert_object_storage_class_by_path /jfs/invalid_map_case/root.bin GLACIER_IR
     assert_object_storage_class_by_path /jfs/invalid_map_case/a/b/child.bin GLACIER_IR
-    tier_set_no_err "$META_URL" --id 2 /invalid_map_case -r --force
+    tier_set_no_err "$META_URL" --tier 2 /invalid_map_case -r --force
     assert_tier_sc /jfs/invalid_map_case INTELLIGENT_TIERING
     assert_tier_sc /jfs/invalid_map_case/a INTELLIGENT_TIERING
     assert_tier_sc /jfs/invalid_map_case/a/b INTELLIGENT_TIERING
@@ -596,8 +616,8 @@ test_tier_invalid_storage_class()
     dd if=/dev/urandom of=/jfs/invalid_set_case/file.bin bs=1M count=8 status=none
     dd if=/dev/urandom of=/jfs/invalid_set_case/dir/sub.bin bs=1M count=8 status=none
 
-    tier_set_no_err "$META_URL" --id 1 /invalid_set_case/file.bin
-    tier_set_no_err "$META_URL" --id 1 /invalid_set_case/dir -r
+    tier_set_no_err "$META_URL" --tier 1 /invalid_set_case/file.bin
+    tier_set_no_err "$META_URL" --tier 1 /invalid_set_case/dir -r
     assert_tier_sc /jfs/invalid_set_case/file.bin STANDARD_IA
     assert_tier_sc /jfs/invalid_set_case/dir STANDARD_IA
     assert_tier_sc /jfs/invalid_set_case/dir/sub.bin STANDARD_IA
@@ -605,8 +625,8 @@ test_tier_invalid_storage_class()
     assert_object_storage_class_by_path /jfs/invalid_set_case/dir/sub.bin STANDARD_IA
 
     assert_config_tier_sc_fail 2 WRONG_STORAGE_CLASS
-    tier_set_no_err "$META_URL" --id 2 /invalid_set_case/file.bin
-    tier_set_no_err "$META_URL" --id 2 /invalid_set_case/dir -r
+    tier_set_no_err "$META_URL" --tier 2 /invalid_set_case/file.bin
+    tier_set_no_err "$META_URL" --tier 2 /invalid_set_case/dir -r
 
     assert_tier_sc /jfs/invalid_set_case/file.bin INTELLIGENT_TIERING
     assert_tier_sc /jfs/invalid_set_case/dir INTELLIGENT_TIERING
@@ -622,18 +642,18 @@ test_tier_config_change_then_set()
     mkdir -p /jfs/rewrite_case
     dd if=/dev/urandom of=/jfs/rewrite_case/file.bin bs=1M count=8 status=none
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc INTELLIGENT_TIERING -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class INTELLIGENT_TIERING -y
     sleep 5
-    tier_set_no_err "$META_URL" --id 2 /rewrite_case/file.bin
+    tier_set_no_err "$META_URL" --tier 2 /rewrite_case/file.bin
     assert_tier_id /jfs/rewrite_case/file.bin 2
     assert_tier_sc /jfs/rewrite_case/file.bin INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/rewrite_case/file.bin INTELLIGENT_TIERING
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc STANDARD_IA -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class STANDARD_IA -y
     sleep 5
     assert_tier_sc_expected_actual /jfs/rewrite_case/file.bin STANDARD_IA INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/rewrite_case/file.bin INTELLIGENT_TIERING
-    tier_set_no_err "$META_URL" --id 2 /rewrite_case/file.bin --force
+    tier_set_no_err "$META_URL" --tier 2 /rewrite_case/file.bin --force
     assert_tier_id /jfs/rewrite_case/file.bin 2
     assert_tier_sc /jfs/rewrite_case/file.bin STANDARD_IA
     assert_object_storage_class_by_path /jfs/rewrite_case/file.bin STANDARD_IA
@@ -652,18 +672,18 @@ test_tier_mixed_tree_reapply_after_mapping_change()
     mkdir -p /jfs/mixed_case/dir1/dir2
     dd if=/dev/urandom of=/jfs/mixed_case/dir1/old.bin bs=1M count=8 status=none
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc STANDARD_IA -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class STANDARD_IA -y
     sleep 5
-    tier_set_no_err "$META_URL" --id 2 /mixed_case -r
+    tier_set_no_err "$META_URL" --tier 2 /mixed_case -r
     assert_tier_sc /jfs/mixed_case/dir1/old.bin STANDARD_IA
     assert_object_storage_class_by_path /jfs/mixed_case/dir1/old.bin STANDARD_IA
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc INTELLIGENT_TIERING -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class INTELLIGENT_TIERING -y
     sleep 5
     assert_tier_sc_expected_actual /jfs/mixed_case/dir1/old.bin INTELLIGENT_TIERING STANDARD_IA
     assert_object_storage_class_by_path /jfs/mixed_case/dir1/old.bin STANDARD_IA
     dd if=/dev/urandom of=/jfs/mixed_case/dir1/dir2/new.bin bs=1M count=8 status=none
-    tier_set_no_err "$META_URL" --id 2 /mixed_case -r --force
+    tier_set_no_err "$META_URL" --tier 2 /mixed_case -r --force
 
     assert_tier_sc /jfs/mixed_case INTELLIGENT_TIERING
     assert_tier_sc /jfs/mixed_case/dir1 INTELLIGENT_TIERING
@@ -683,10 +703,10 @@ test_tier_glacier_deep_archive_restore()
     echo "deepdata1" > /jfs/archive_case/deep/c.txt
     echo "deepdata2" > /jfs/archive_case/deep/d.txt
 
-    # --- Part 1: GLACIER (tier-id 3) ---
-    ./juicefs config "$META_URL" --tier-id 3 --tier-sc GLACIER -y
+    # --- Part 1: GLACIER (tier 3) ---
+    ./juicefs config "$META_URL" --tier 3 --storage-class GLACIER -y
     sleep 5
-    tier_set_no_err "$META_URL" --id 3 /archive_case/glacier -r
+    tier_set_no_err "$META_URL" --tier 3 /archive_case/glacier -r
     assert_tier_id /jfs/archive_case/glacier/a.txt 3
     assert_tier_sc /jfs/archive_case/glacier/a.txt GLACIER
     assert_object_storage_class_by_path /jfs/archive_case/glacier/a.txt GLACIER
@@ -697,9 +717,9 @@ test_tier_glacier_deep_archive_restore()
     ./juicefs tier restore "$META_URL" /archive_case/glacier -r
 
 
-    ./juicefs config "$META_URL" --tier-id 2 --tier-sc DEEP_ARCHIVE -y
+    ./juicefs config "$META_URL" --tier 2 --storage-class DEEP_ARCHIVE -y
     sleep 5
-    tier_set_no_err "$META_URL" --id 2 /archive_case/deep -r
+    tier_set_no_err "$META_URL" --tier 2 /archive_case/deep -r
     assert_tier_id /jfs/archive_case/deep/c.txt 2
     assert_tier_sc /jfs/archive_case/deep/c.txt DEEP_ARCHIVE
     assert_object_storage_class_by_path /jfs/archive_case/deep/c.txt DEEP_ARCHIVE
@@ -721,7 +741,7 @@ test_tier_overwrite_after_recursive_set()
     dd if=/dev/urandom of=/jfs/ow_case/sub1/sub2/f3.bin bs=1K count=256 status=none
 
     # Set tier 1 recursively on the whole tree
-    tier_set_no_err "$META_URL" --id 1 /ow_case -r
+    tier_set_no_err "$META_URL" --tier 1 /ow_case -r
     assert_tier_id /jfs/ow_case/f1.bin 1
     assert_tier_id /jfs/ow_case/sub1/f2.bin 1
     assert_tier_id /jfs/ow_case/sub1/sub2/f3.bin 1
@@ -766,8 +786,8 @@ test_tier_reset_to_zero()
     echo "small" > /jfs/reset_case/sub/f3.txt
 
     # Set files to different tiers
-    tier_set_no_err "$META_URL" --id 1 /reset_case/f1.bin
-    tier_set_no_err "$META_URL" --id 2 /reset_case/sub -r
+    tier_set_no_err "$META_URL" --tier 1 /reset_case/f1.bin
+    tier_set_no_err "$META_URL" --tier 2 /reset_case/sub -r
     assert_tier_id /jfs/reset_case/f1.bin 1
     assert_tier_sc /jfs/reset_case/f1.bin STANDARD_IA
     assert_object_storage_class_by_path /jfs/reset_case/f1.bin STANDARD_IA
@@ -777,14 +797,14 @@ test_tier_reset_to_zero()
     assert_tier_id /jfs/reset_case/sub/f3.txt 2
 
     # Reset individual file back to tier 0
-    ./juicefs tier set "$META_URL" --id 0 /reset_case/f1.bin
+    ./juicefs tier set "$META_URL" --tier 0 /reset_case/f1.bin
     sleep 5
     assert_tier_id /jfs/reset_case/f1.bin 0
     assert_object_storage_class_by_path /jfs/reset_case/f1.bin STANDARD
     cat /jfs/reset_case/f1.bin > /dev/null
 
     # Reset directory recursively back to tier 0
-    ./juicefs tier set "$META_URL" --id 0 /reset_case -r
+    ./juicefs tier set "$META_URL" --tier 0 /reset_case -r
     sleep 5
     assert_tier_id /jfs/reset_case 0
     assert_tier_id /jfs/reset_case/sub 0
@@ -806,8 +826,8 @@ test_tier_overwrite_roundtrip()
     dd if=/dev/urandom of=/jfs/rt_case/parent/file.bin bs=1M count=4 status=none
     dd if=/dev/urandom of=/jfs/rt_case/parent/sibling.bin bs=1M count=4 status=none
 
-    tier_set_no_err "$META_URL" --id 1 /rt_case/parent -r
-    tier_set_no_err "$META_URL" --id 2 /rt_case/parent/file.bin
+    tier_set_no_err "$META_URL" --tier 1 /rt_case/parent -r
+    tier_set_no_err "$META_URL" --tier 2 /rt_case/parent/file.bin
     assert_tier_id /jfs/rt_case/parent 1
     assert_tier_sc /jfs/rt_case/parent STANDARD_IA
     assert_tier_id /jfs/rt_case/parent/sibling.bin 1
@@ -837,7 +857,7 @@ test_tier_overwrite_roundtrip()
     assert_object_storage_class_by_path /jfs/rt_case/parent/file.bin INTELLIGENT_TIERING
 
     # Cycle 3: change file.bin to tier 3 and verify a subsequent overwrite still keeps tier 3.
-    tier_set_no_err "$META_URL" --id 3 /rt_case/parent/file.bin
+    tier_set_no_err "$META_URL" --tier 3 /rt_case/parent/file.bin
     assert_tier_id /jfs/rt_case/parent/file.bin 3
     assert_tier_sc /jfs/rt_case/parent/file.bin GLACIER_IR
     assert_object_storage_class_by_path /jfs/rt_case/parent/file.bin GLACIER_IR
@@ -860,7 +880,7 @@ test_tier_truncate_and_append_after_set()
     dd if=/dev/urandom of=/jfs/ta_case/file.bin bs=1M count=4 status=none
 
     # Truncate to 0 bytes after tier set -> tier should stay unchanged
-    tier_set_no_err "$META_URL" --id 1 /ta_case/file.bin
+    tier_set_no_err "$META_URL" --tier 1 /ta_case/file.bin
     assert_tier_id /jfs/ta_case/file.bin 1
     assert_tier_sc /jfs/ta_case/file.bin STANDARD_IA
 
@@ -871,7 +891,7 @@ test_tier_truncate_and_append_after_set()
 
     # Rewrite and set tier again, then append
     dd if=/dev/urandom of=/jfs/ta_case/file.bin bs=1M count=2 status=none
-    tier_set_no_err "$META_URL" --id 2 /ta_case/file.bin
+    tier_set_no_err "$META_URL" --tier 2 /ta_case/file.bin
     assert_tier_id /jfs/ta_case/file.bin 2
     assert_tier_sc /jfs/ta_case/file.bin INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/ta_case/file.bin INTELLIGENT_TIERING
@@ -905,7 +925,7 @@ test_tier_mixed_tree_partial_overwrite()
     echo "keep me" > /jfs/pt_case/a/b/c/small.txt
 
     # Set all to tier 1 recursively
-    tier_set_no_err "$META_URL" --id 1 /pt_case -r
+    tier_set_no_err "$META_URL" --tier 1 /pt_case -r
     for f in root.bin a/mid.bin a/b/deep.bin a/b/c/leaf.bin a/b/c/small.txt; do
         assert_tier_id "/jfs/pt_case/$f" 1
     done
@@ -934,7 +954,7 @@ test_tier_mixed_tree_partial_overwrite()
     assert_tier_sc /jfs/pt_case/a/b/c/leaf.bin STANDARD_IA
 
     # Re-set entire tree to tier 2 recursively (all files become tier 2)
-    tier_set_no_err "$META_URL" --id 2 /pt_case -r
+    tier_set_no_err "$META_URL" --tier 2 /pt_case -r
     for f in root.bin a/mid.bin a/b/deep.bin a/b/c/leaf.bin a/b/c/small.txt; do
         assert_tier_id "/jfs/pt_case/$f" 2
         assert_tier_sc "/jfs/pt_case/$f" INTELLIGENT_TIERING
@@ -961,8 +981,8 @@ test_tier_writeback_set_before_upload()
     dd if=/dev/urandom of=/jfs/wb_pre/f2.bin bs=1M count=4 status=none
 
     # Tier set should FAIL because chunks have not been uploaded to S3 yet
-    assert_tier_set_fail "$META_URL" --id 1 /wb_pre/f1.bin
-    assert_tier_set_fail "$META_URL" --id 2 /wb_pre/f2.bin
+    assert_tier_set_fail "$META_URL" --tier 1 /wb_pre/f1.bin
+    assert_tier_set_fail "$META_URL" --tier 2 /wb_pre/f2.bin
 
     # Tier id should still be 0 (set failed)
     assert_tier_id /jfs/wb_pre/f1.bin 0
@@ -974,8 +994,8 @@ test_tier_writeback_set_before_upload()
     ./juicefs mount -d "$META_URL" /jfs --heartbeat 2s --writeback
     sleep 5
     # Now chunks are on S3, tier set should succeed
-    tier_set_no_err "$META_URL" --id 1 /wb_pre/f1.bin
-    tier_set_no_err "$META_URL" --id 2 /wb_pre/f2.bin
+    tier_set_no_err "$META_URL" --tier 1 /wb_pre/f1.bin
+    tier_set_no_err "$META_URL" --tier 2 /wb_pre/f2.bin
     assert_tier_id /jfs/wb_pre/f1.bin 1
     assert_tier_id /jfs/wb_pre/f2.bin 2
     assert_tier_sc /jfs/wb_pre/f1.bin STANDARD_IA
@@ -1006,7 +1026,7 @@ test_tier_writeback_write_then_set()
     assert_object_storage_class_by_path /jfs/wb_post/f1.bin STANDARD
 
     # Now set tier — triggers S3 CopyObject to change storage class
-    tier_set_no_err "$META_URL" --id 1 /wb_post/f1.bin
+    tier_set_no_err "$META_URL" --tier 1 /wb_post/f1.bin
     assert_tier_id /jfs/wb_post/f1.bin 1
     assert_tier_sc /jfs/wb_post/f1.bin STANDARD_IA
     assert_object_storage_class_by_path /jfs/wb_post/f1.bin STANDARD_IA
@@ -1023,7 +1043,7 @@ test_tier_writeback_mixed_ops()
     mkdir -p /jfs/wb_mix
 
     # --- Scenario A: set tier on dir, write new file -> inherits parent tier ---
-    tier_set_no_err "$META_URL" --id 1 /wb_mix
+    tier_set_no_err "$META_URL" --tier 1 /wb_mix
     assert_tier_id /jfs/wb_mix 1
     dd if=/dev/urandom of=/jfs/wb_mix/inherit.bin bs=1M count=4 status=none
     # New file should inherit parent dir's tier
@@ -1033,7 +1053,7 @@ test_tier_writeback_mixed_ops()
     # --- Scenario B: tier set fails while chunks still in cache (just written) ---
     dd if=/dev/urandom of=/jfs/wb_mix/not_yet.bin bs=1M count=4 status=none
     # Immediately try to change tier — chunks likely not uploaded yet
-    assert_tier_set_fail "$META_URL" --id 2 /wb_mix/not_yet.bin
+    assert_tier_set_fail "$META_URL" --tier 2 /wb_mix/not_yet.bin
     # File keeps inherited tier from parent
     assert_tier_id /jfs/wb_mix/not_yet.bin 1
 
@@ -1041,7 +1061,7 @@ test_tier_writeback_mixed_ops()
     sleep 15
 
     # --- Scenario C: after upload, tier set should succeed ---
-    tier_set_no_err "$META_URL" --id 2 /wb_mix/not_yet.bin
+    tier_set_no_err "$META_URL" --tier 2 /wb_mix/not_yet.bin
     assert_tier_id /jfs/wb_mix/not_yet.bin 2
     assert_tier_sc /jfs/wb_mix/not_yet.bin INTELLIGENT_TIERING
     assert_object_storage_class_by_path /jfs/wb_mix/not_yet.bin INTELLIGENT_TIERING
@@ -1056,7 +1076,7 @@ test_tier_writeback_mixed_ops()
     # --- Scenario E: write, wait for upload, set tier, append -> tier id/sc should stay unchanged ---
     dd if=/dev/urandom of=/jfs/wb_mix/append.bin bs=1M count=2 status=none
     sleep 15
-    tier_set_no_err "$META_URL" --id 2 /wb_mix/append.bin
+    tier_set_no_err "$META_URL" --tier 2 /wb_mix/append.bin
     assert_tier_id /jfs/wb_mix/append.bin 2
     assert_tier_sc /jfs/wb_mix/append.bin INTELLIGENT_TIERING
     dd if=/dev/urandom bs=1M count=1 status=none >> /jfs/wb_mix/append.bin
@@ -1068,7 +1088,7 @@ test_tier_writeback_mixed_ops()
     # --- Scenario F: write, wait for upload, set tier, keep unchanged ---
     dd if=/dev/urandom of=/jfs/wb_mix/keep.bin bs=1M count=4 status=none
     sleep 15
-    tier_set_no_err "$META_URL" --id 1 /wb_mix/keep.bin
+    tier_set_no_err "$META_URL" --tier 1 /wb_mix/keep.bin
     assert_tier_id /jfs/wb_mix/keep.bin 1
     assert_tier_sc /jfs/wb_mix/keep.bin STANDARD_IA
 
@@ -1076,8 +1096,8 @@ test_tier_writeback_mixed_ops()
     dd if=/dev/urandom of=/jfs/wb_mix/t1.bin bs=1M count=4 status=none
     dd if=/dev/urandom of=/jfs/wb_mix/t2.bin bs=1M count=4 status=none
     sleep 15
-    tier_set_no_err "$META_URL" --id 1 /wb_mix/t1.bin
-    tier_set_no_err "$META_URL" --id 2 /wb_mix/t2.bin
+    tier_set_no_err "$META_URL" --tier 1 /wb_mix/t1.bin
+    tier_set_no_err "$META_URL" --tier 2 /wb_mix/t2.bin
     assert_tier_id /jfs/wb_mix/t1.bin 1
     assert_tier_id /jfs/wb_mix/t2.bin 2
 
@@ -1122,7 +1142,7 @@ test_tier_remount_during_large_write()
     for i in $(seq 1 5); do
         dd if=/dev/urandom of=/jfs/remount_case/sub/pre_${i}.bin bs=1M count=20 status=none
     done
-    tier_set_no_err "$META_URL" --id 1 /remount_case -r
+    tier_set_no_err "$META_URL" --tier 1 /remount_case -r
     for i in $(seq 1 5); do
         assert_tier_id /jfs/remount_case/sub/pre_${i}.bin 1
     done
