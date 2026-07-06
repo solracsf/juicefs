@@ -1386,6 +1386,20 @@ func startSingleProducer(tasks chan<- object.Object, src, dst object.ObjectStora
 func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, config *Config, checkpointMgr *CheckpointManager, prefix string) (retErr error) {
 	srckeys = filter(srckeys, config.rules, config)
 	dstkeys = filter(dstkeys, config.rules, config)
+	// produce may return early (limit reached or listing failure) without
+	// consuming all the keys; drain the filtered channels in the background
+	// so the filter goroutines and the listers feeding them can finish
+	// instead of leaking
+	defer func() {
+		go func() {
+			for range srckeys {
+			}
+		}()
+		go func() {
+			for range dstkeys {
+			}
+		}()
+	}()
 	var dstobj object.Object
 	var (
 		skip, skipBytes int64
@@ -2029,10 +2043,12 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 		}
 	}
 	// sync returned objects
-	if err := produce(tasks, srckeys, dstkeys, config, checkpointMgr, prefix); err != nil {
-		return err
+	err = produce(tasks, srckeys, dstkeys, config, checkpointMgr, prefix)
+	// produce may return early (limit reached or error) without consuming all
+	// the keys; drain both channels so the listing goroutines can finish and
+	// stop sending to commonPrefix, making it safe to close it below
+	for range srckeys {
 	}
-	// consume all the keys from dst
 	for range dstkeys {
 	}
 	close(commonPrefix)
@@ -2040,7 +2056,7 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 	<-config.concurrentList
 	<-done
 	config.concurrentList <- 1
-	return nil
+	return err
 }
 
 // Sync syncs all the keys between to object storage

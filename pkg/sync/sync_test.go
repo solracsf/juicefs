@@ -24,11 +24,13 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 func collectAll(c <-chan object.Object) []string {
@@ -1159,5 +1161,58 @@ func TestSyncEncryptLargeFile(t *testing.T) {
 	got, _ := io.ReadAll(r)
 	if !bytes.Equal(got, largeData) {
 		t.Fatalf("decrypted large file mismatch: got %d bytes, want %d", len(got), len(largeData))
+	}
+}
+
+// When produce() returns early (limit reached), the multi-threaded
+// startProducer must still drain the listing channels so their goroutines
+// finish, and only close commonPrefix after the listers can no longer send
+// to it.
+func TestStartProducerLimitNoGoroutineLeak(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "limit-leak-src", "", "", "")
+	dst, _ := object.CreateStorage("mem", "limit-leak-dst", "", "", "")
+	putObjects(t, src, "f1", "f2", "f3", "f4", "f5", "d1/x", "d2/x", "d3/x")
+
+	progress := utils.NewProgress(true)
+	defer progress.Done()
+	handled = progress.AddCountBar("Scanned objects", 0)
+	excluded = progress.AddCountSpinner("Excluded objects")
+	excludedBytes = progress.AddByteSpinner("Excluded bytes")
+	skipped = progress.AddCountSpinner("Skipped objects")
+	skippedBytes = progress.AddByteSpinner("Skipped bytes")
+	extra = progress.AddCountSpinner("Extra objects")
+	extraBytes = progress.AddByteSpinner("Extra bytes")
+	failed = progress.AddCountSpinner("Failed objects")
+
+	tasks := make(chan object.Object, 100)
+	defer close(tasks)
+	go func() {
+		for range tasks {
+		}
+	}()
+
+	config := newTestConfig()
+	config.EnableCheckpoint = false
+	config.concurrentList = make(chan int, config.ListThreads)
+
+	settle := func() {
+		runtime.GC()
+		time.Sleep(300 * time.Millisecond)
+		runtime.GC()
+	}
+	settle()
+	base := runtime.NumGoroutine()
+
+	const cycles = 20
+	for i := 0; i < cycles; i++ {
+		config.Limit = 2 // exhausted after two objects, leaving f4/f5 unconsumed
+		if err := startProducer(tasks, src, dst, "", 1, config, nil); err != nil {
+			t.Fatalf("startProducer: %v", err)
+		}
+	}
+
+	settle()
+	if leaked := runtime.NumGoroutine() - base; leaked > cycles/10 {
+		t.Fatalf("leaked %d goroutines after %d limited startProducer runs", leaked, cycles)
 	}
 }
