@@ -296,6 +296,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *redisMeta) Shutdown() error {
+	m.of.close()
 	if m.cache != nil {
 		m.cache.close()
 		m.cache = nil
@@ -5011,6 +5012,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 		return err
 	}
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	bar := progress.AddCountBar("Dumped entries", 1) // with root
 	useTotal := root == RootInode && !skipTrash
 	if useTotal {
@@ -5059,7 +5061,6 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 	if _, err = bw.WriteString("\n}\n"); err != nil {
 		return err
 	}
-	progress.Done()
 
 	return bw.Flush()
 }

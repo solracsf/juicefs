@@ -545,6 +545,7 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *dbMeta) Shutdown() error {
+	m.of.close()
 	return m.db.Close()
 }
 
@@ -1213,7 +1214,7 @@ func (m *dbMeta) shouldRetry(err error) bool {
 		// error 1020 for MariaDB when conflict
 		return strings.Contains(msg, "try restarting transaction") || strings.Contains(msg, "try again later") ||
 			strings.Contains(msg, "duplicate entry") || strings.Contains(msg, "error 1020 (hy000)") ||
-			strings.Contains(msg, "invalid connection") || strings.Contains(msg, "bad connection") || errors.Is(err, io.EOF) // could not send data to client: No buffer space available
+			strings.Contains(msg, "invalid connection") || strings.Contains(msg, "bad connection") || errors.Is(err, io.EOF) || strings.Contains(msg, "serialize access") // could not send data to client: No buffer space available
 	case "postgres":
 		if e, ok := err.(interface{ SafeToRetry() bool }); ok {
 			return e.SafeToRetry()
@@ -4890,6 +4891,7 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	}()
 
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	var tree, trash *DumpedEntry
 	root = m.checkRoot(root)
 	return m.roTxn(Background(), func(s *xorm.Session) error {
@@ -5098,7 +5100,6 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 		if _, err = bw.WriteString("\n}\n"); err != nil {
 			return err
 		}
-		progress.Done()
 		return bw.Flush()
 	})
 }

@@ -128,6 +128,7 @@ func newKVMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *kvMeta) Shutdown() error {
+	m.of.close()
 	return m.client.close()
 }
 
@@ -3949,6 +3950,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	}
 
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	var tree, trash *DumpedEntry
 	root = m.checkRoot(root)
 
@@ -4237,7 +4239,6 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	if _, err = bw.WriteString("\n}\n"); err != nil {
 		return err
 	}
-	progress.Done()
 
 	return bw.Flush()
 }
@@ -5065,7 +5066,12 @@ func (m *kvMeta) getDirFetcher() dirFetcher {
 		}
 
 		if cursor != nil {
-			keys, vals = keys[1:], vals[1:]
+			// The cursor may have been deleted concurrently
+			if len(keys) > 0 && bytes.Equal(keys[0], startKey) {
+				keys, vals = keys[1:], vals[1:]
+			} else if len(keys) > limit-1 {
+				keys, vals = keys[:limit-1], vals[:limit-1]
+			}
 		}
 
 		if total > limit && offset <= len(keys) {
