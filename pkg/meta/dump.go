@@ -453,6 +453,7 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 	}
 
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	bar := progress.AddCountBar("Loaded entries", 1) // with root
 	dm = &DumpedMeta{}
 	counters = &DumpedCounters{ // rebuild counters
@@ -500,7 +501,6 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 		}
 	}
 	_, _ = dec.Token() // }
-	progress.Done()
 
 	if err = dm.validate(); err != nil {
 		return
