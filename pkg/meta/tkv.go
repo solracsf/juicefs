@@ -3828,6 +3828,24 @@ func (m *kvMeta) dumpDir(ctx Context, inode Ino, tree *DumpedEntry, bw *bufio.Wr
 		}
 	}
 
+	// on an early error return (or panic), wake up the workers blocked on
+	// their cond so they can observe the error and exit instead of leaking
+	defer func() {
+		p := recover()
+		if p != nil && err == nil {
+			err = fmt.Errorf("dump dir %d: %v", inode, p)
+		}
+		if err != nil {
+			for c := range conds {
+				ms[c].Lock()
+				conds[c].Broadcast()
+				ms[c].Unlock()
+			}
+		}
+		if p != nil {
+			panic(p)
+		}
+	}()
 	for i, e := range entries {
 		c := i % threads
 		ms[c].Lock()

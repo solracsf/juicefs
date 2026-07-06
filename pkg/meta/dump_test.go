@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"fmt"
 	"io"
 	"path"
 	"runtime"
@@ -128,6 +129,67 @@ func TestMemKVLoadMetaNoGoroutineLeakOnFailure(t *testing.T) {
 		}
 		return m
 	})
+}
+
+// A dump with threads > 1 uses per-thread cond workers in dumpDir; when one
+// entry fails, the workers holding later entries must be woken up and exit.
+func TestSQLDumpMetaThreadedNoGoroutineLeakOnFailure(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "dump-threaded-leak.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err := metaClient.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	if err := metaClient.Init(testFormat(), true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	t.Cleanup(func() { _ = metaClient.Shutdown() })
+
+	ctx := Background()
+	var inode Ino
+	attr := &Attr{}
+	// symlinks dump fine; the file "b" has a chunk and fails once the chunk
+	// table is dropped, sorted between them so a worker is mid-handshake
+	for _, name := range []string{"a1", "a2"} {
+		if st := metaClient.Symlink(ctx, RootInode, name, "target", &inode, attr); st != 0 {
+			t.Fatalf("symlink %s: %s", name, st)
+		}
+	}
+	if st := metaClient.Create(ctx, RootInode, "b", 0644, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create b: %s", st)
+	}
+	var sliceId uint64
+	if st := metaClient.NewSlice(ctx, &sliceId); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	if st := metaClient.Write(ctx, inode, 0, 0, Slice{Id: sliceId, Size: 4096, Len: 4096}, time.Now()); st != 0 {
+		t.Fatalf("write b: %s", st)
+	}
+	for i := 0; i < 8; i++ {
+		if st := metaClient.Symlink(ctx, RootInode, fmt.Sprintf("c%d", i), "target", &inode, attr); st != 0 {
+			t.Fatalf("symlink c%d: %s", i, st)
+		}
+	}
+	dm := metaClient.(*dbMeta)
+	if _, err := dm.db.Exec("DROP TABLE " + dm.tablePrefix + "chunk"); err != nil {
+		t.Fatalf("drop chunk table: %s", err)
+	}
+
+	settleGoroutines()
+	base := runtime.NumGoroutine()
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		if err := metaClient.DumpMeta(io.Discard, RootInode, 2, false, false, true); err == nil {
+			t.Fatal("expected DumpMeta to fail")
+		}
+	}
+
+	settleGoroutines()
+	if leaked := runtime.NumGoroutine() - base; leaked > cycles/10 {
+		t.Fatalf("leaked %d goroutines after %d failed threaded DumpMeta calls", leaked, cycles)
+	}
 }
 
 type failFastDumpScan struct {
