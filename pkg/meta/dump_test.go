@@ -20,6 +20,7 @@ import (
 	"io"
 	"path"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,6 +77,57 @@ func TestSQLDumpMetaNoGoroutineLeakOnFailure(t *testing.T) {
 			}
 		},
 	)
+}
+
+// The truncated stream fails inside loadEntries after the load workers and
+// the progress bar are created, so both must be cleaned up on the error path.
+func testLoadMetaNoGoroutineLeakOnFailure(t *testing.T, setup func(t *testing.T) Meta) {
+	t.Helper()
+	m := setup(t)
+	t.Cleanup(func() { _ = m.Shutdown() })
+
+	settleGoroutines()
+	base := runtime.NumGoroutine()
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		if err := m.LoadMeta(strings.NewReader(`{"FSTree":`)); err == nil {
+			t.Fatal("expected LoadMeta to fail")
+		}
+	}
+
+	settleGoroutines()
+	if leaked := runtime.NumGoroutine() - base; leaked > cycles/10 {
+		t.Fatalf("leaked %d goroutines after %d failed LoadMeta calls", leaked, cycles)
+	}
+}
+
+func TestSQLLoadMetaNoGoroutineLeakOnFailure(t *testing.T) {
+	testLoadMetaNoGoroutineLeakOnFailure(t, func(t *testing.T) Meta {
+		t.Helper()
+		metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "load-leak.db"), testConfig())
+		if err != nil {
+			t.Fatalf("create meta: %s", err)
+		}
+		if err := metaClient.Reset(); err != nil {
+			t.Fatalf("reset meta: %s", err)
+		}
+		return metaClient
+	})
+}
+
+func TestMemKVLoadMetaNoGoroutineLeakOnFailure(t *testing.T) {
+	testLoadMetaNoGoroutineLeakOnFailure(t, func(t *testing.T) Meta {
+		t.Helper()
+		m, err := newKVMeta("memkv", "jfs-load-leak", testConfig())
+		if err != nil {
+			t.Fatalf("create meta: %s", err)
+		}
+		if err := m.Reset(); err != nil {
+			t.Fatalf("reset meta: %s", err)
+		}
+		return m
+	})
 }
 
 type failFastDumpScan struct {

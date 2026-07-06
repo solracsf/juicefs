@@ -4348,6 +4348,14 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 			}
 		}()
 	}
+	var closeOnce sync.Once
+	closeAndWait := func() {
+		closeOnce.Do(func() {
+			close(kv)
+			wg.Wait()
+		})
+	}
+	defer closeAndWait() // let the workers exit when loading fails halfway
 
 	var aclMaxId uint32
 	dm, counters, parents, refs, err := loadEntries(r, func(e *DumpedEntry) { m.loadEntry(e, kv, &aclMaxId) }, nil)
@@ -4378,8 +4386,7 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 			kv <- &pair{m.sliceKey(k.id, k.size), packCounter(v - 1)}
 		}
 	}
-	close(kv)
-	wg.Wait()
+	closeAndWait()
 
 	// update nlinks and parents for hardlinks
 	st := make(map[Ino]int64)

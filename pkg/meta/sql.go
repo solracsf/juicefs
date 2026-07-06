@@ -5246,6 +5246,16 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 			}
 		}(i)
 	}
+	var closeOnce sync.Once
+	closeAndWait := func() {
+		closeOnce.Do(func() {
+			for _, c := range chs {
+				close(c)
+			}
+			wg.Wait()
+		})
+	}
+	defer closeAndWait() // let the workers exit when loading fails halfway
 
 	var aclMaxId uint32 = 0
 	dm, counters, parents, refs, err := loadEntries(r,
@@ -5272,10 +5282,7 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 	for _, d := range dm.DelFiles {
 		chs[5] <- &delfile{d.Inode, d.Length, d.Expire}
 	}
-	for _, c := range chs {
-		close(c)
-	}
-	wg.Wait()
+	closeAndWait()
 
 	// update chunkRefs
 	if err = m.txn(func(s *xorm.Session) error {
