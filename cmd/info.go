@@ -103,6 +103,7 @@ func info(ctx *cli.Context) error {
 		}
 		if err != nil {
 			logger.Errorf("lookup inode for %q: %s", path, err)
+			progress.Done()
 			continue
 		}
 		if inode < uint64(meta.RootInode) {
@@ -111,6 +112,7 @@ func info(ctx *cli.Context) error {
 		f, err := openController(d)
 		if err != nil {
 			logger.Errorf("Open control file for %q: %s", d, err)
+			progress.Done()
 			continue
 		}
 
@@ -129,6 +131,7 @@ func info(ctx *cli.Context) error {
 			dspin.SetCurrent(int64(count), int64(size))
 		})
 		if errno == syscall.EINVAL {
+			progress.Done()
 			legacyInfo(d, path, inode, recursive, raw)
 			continue
 		} else if errno != 0 {
