@@ -834,8 +834,10 @@ const (
 )
 
 func (m *baseMeta) startDeleteSliceTasks() {
-	m.Lock()
-	defer m.Unlock()
+	// dslices is guarded by dSliceMu, the same lock stopDeleteSliceTasks and
+	// deleteSlice take
+	m.dSliceMu.Lock()
+	defer m.dSliceMu.Unlock()
 	if m.conf.MaxDeletes <= 0 || m.dslices != nil {
 		return
 	}

@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -3971,13 +3972,14 @@ func testClone(t *testing.T, m Meta) {
 		t.Fatalf("Rmdir: %s", eno)
 	}
 
-	var sli1del, sli2del bool
+	// set from the background delete-slice goroutine, read by the test below
+	var sli1del, sli2del atomic.Bool
 	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
 		if args[0].(uint64) == sliceId {
-			sli1del = true
+			sli1del.Store(true)
 		}
 		if args[0].(uint64) == sliceId2 {
-			sli2del = true
+			sli2del.Store(true)
 		}
 		return nil
 	})
@@ -4052,7 +4054,7 @@ func testClone(t *testing.T, m Meta) {
 
 	}
 	time.Sleep(1 * time.Second)
-	if !sli1del || !sli2del {
+	if !sli1del.Load() || !sli2del.Load() {
 		t.Fatalf("slice should be deleted")
 	}
 	nodes := m.(engine).doFindDetachedNodes(time.Now())
