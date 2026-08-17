@@ -101,6 +101,7 @@ const (
 	FlagWindowsSystem
 	FlagWindowsArchive
 	FlagSkipTrash // skip moving to .trash - Mapped to 's' in chattr
+	FlagSnapshot  // frozen as part of a snapshot; its flags can no longer be changed
 )
 
 const (
@@ -118,6 +119,10 @@ type Ino uint64
 
 const RootInode Ino = 1
 const TrashInode Ino = 0x7FFFFFFF10000000 // larger than vfs.minInternalNode
+// SnapshotInode bounds the trash range from above and starts the range reserved
+// for snapshot roots. Trash inodes are TrashInode plus the nextTrash counter, so
+// that counter must stay below SnapshotInode-TrashInode.
+const SnapshotInode Ino = 0x7FFFFFFF20000000
 
 const RmrDefaultThreads = 50
 
@@ -132,7 +137,11 @@ func (i Ino) IsValid() bool {
 }
 
 func (i Ino) IsTrash() bool {
-	return i >= TrashInode
+	return i >= TrashInode && i < SnapshotInode
+}
+
+func (i Ino) IsSnapshot() bool {
+	return i >= SnapshotInode
 }
 
 func (i Ino) IsNormal() bool {
@@ -140,6 +149,14 @@ func (i Ino) IsNormal() bool {
 }
 
 var TrashName = ".trash"
+var SnapshotName = ".snapshots"
+
+// isReservedEntry reports whether name is one of the hidden roots under the volume
+// root. They are resolved by Lookup rather than by a directory entry, so they must
+// never be created, renamed or removed through the normal namespace calls.
+func isReservedEntry(parent Ino, name string) bool {
+	return parent == RootInode && (name == TrashName || name == SnapshotName)
+}
 
 type internalNode struct {
 	inode Ino

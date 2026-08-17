@@ -545,7 +545,10 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						if cs.NextInode <= int64(inode) {
 							cs.NextInode = int64(inode) + 1
 						}
-					} else {
+					} else if inode.IsTrash() {
+						// only the trash range feeds the trash counter: folding a
+						// reserved inode from above it in would push the counter
+						// past the range and wedge every later trash allocation
 						if cs.NextTrash < int64(inode-TrashInode) {
 							cs.NextTrash = int64(inode - TrashInode)
 						}

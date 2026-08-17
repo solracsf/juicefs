@@ -1304,6 +1304,15 @@ func (m *baseMeta) Lookup(ctx Context, parent Ino, name string, inode *Ino, attr
 		*inode = TrashInode
 		return 0
 	}
+	if parent == RootInode && name == SnapshotName {
+		// the root is created with the first snapshot, so ENOENT here simply means
+		// this volume has none yet
+		if st := m.GetAttr(ctx, SnapshotInode, attr); st != 0 {
+			return st
+		}
+		*inode = SnapshotInode
+		return 0
+	}
 	st := m.en.doLookup(ctx, parent, name, inode, attr)
 	if st == syscall.ENOENT && m.conf.CaseInsensi {
 		if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -1616,10 +1625,10 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	if _type < TypeFile || _type > TypeSocket {
 		return syscall.EINVAL
 	}
-	if parent.IsTrash() {
+	if parent.IsTrash() || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
-	if parent == RootInode && name == TrashName {
+	if isReservedEntry(parent, name) {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1715,10 +1724,10 @@ func (m *baseMeta) Symlink(ctx Context, parent Ino, name string, path string, in
 }
 
 func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr) syscall.Errno {
-	if parent.IsTrash() {
+	if parent.IsTrash() || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
-	if parent == RootInode && name == TrashName {
+	if isReservedEntry(parent, name) {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1740,6 +1749,11 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 		return st
 	}
 	if attr.Typ == TypeDirectory {
+		return syscall.EPERM
+	}
+	// linking snapshot content into the live namespace would give it a mutable
+	// path: doLink clears the parent, which is what the write check relies on
+	if inode.IsSnapshot() || attr.Flags&FlagSnapshot != 0 {
 		return syscall.EPERM
 	}
 
@@ -1807,7 +1821,7 @@ func (m *baseMeta) ReadLink(ctx Context, inode Ino, path *[]byte) syscall.Errno 
 }
 
 func (m *baseMeta) Unlink(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno {
-	if parent == RootInode && name == TrashName || parent.IsTrash() && ctx.Uid() != 0 {
+	if isReservedEntry(parent, name) || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1838,7 +1852,7 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 	if name == ".." {
 		return syscall.ENOTEMPTY
 	}
-	if parent == RootInode && name == TrashName || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 {
+	if isReservedEntry(parent, name) || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1868,6 +1882,11 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count *uint64, skipCheckTrash bool) syscall.Errno {
 	if len(entries) == 0 {
 		return 0
+	}
+	// reached directly from the Meta interface and from emptyDir, so it needs the
+	// same guard as Unlink rather than relying on the caller having one
+	if parent.IsSnapshot() {
+		return syscall.EPERM
 	}
 	var delta dirStat
 	st := m.en.doBatchUnlink(ctx, parent, entries, &delta, skipCheckTrash)
@@ -1903,7 +1922,7 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 }
 
 func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
-	if parentSrc == RootInode && nameSrc == TrashName || parentDst == RootInode && nameDst == TrashName {
+	if isReservedEntry(parentSrc, nameSrc) || isReservedEntry(parentDst, nameDst) || parentSrc.IsSnapshot() || parentDst.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if parentDst.IsTrash() || parentSrc.IsTrash() && ctx.Uid() != 0 {
@@ -2341,7 +2360,7 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 }
 
 func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
-	if inode == RootInode || inode == TrashInode {
+	if inode == RootInode || inode == TrashInode || inode == SnapshotInode {
 		return map[Ino]int{1: 1}
 	}
 	var attr Attr
@@ -2363,6 +2382,9 @@ func (m *baseMeta) GetPaths(ctx Context, inode Ino) []string {
 
 	if inode == TrashInode {
 		return []string{"/.trash"}
+	}
+	if inode == SnapshotInode {
+		return []string{"/" + SnapshotName}
 	}
 
 	outside := "path not shown because it's outside of the mounted root"
@@ -2387,8 +2409,12 @@ func (m *baseMeta) GetPaths(ctx Context, inode Ino) []string {
 					break
 				}
 			}
+			// the hidden roots have no entry under the root to be found above
 			if attr.Parent == RootInode && ino == TrashInode {
 				name = TrashName
+			}
+			if attr.Parent == RootInode && ino == SnapshotInode {
+				name = SnapshotName
 			}
 			if name == "" {
 				return "", fmt.Errorf("entry %d/%d not found", attr.Parent, ino)
@@ -3048,6 +3074,45 @@ func (m *baseMeta) toTrash(parent Ino) bool {
 	return m.getFormat().TrashDays > 0
 }
 
+// ensureSnapshotRoot creates the hidden .snapshots directory the first time a
+// snapshot is taken. Unlike the trash root it is not created at format time, so a
+// volume that never snapshots carries nothing extra and needs no format change.
+func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
+	st := m.en.doGetAttr(ctx, SnapshotInode, nil)
+	if st != syscall.ENOENT {
+		return st // already there, or a real error
+	}
+	now := time.Now()
+	attr := Attr{
+		Typ:    TypeDirectory,
+		Mode:   0555,
+		Nlink:  2,
+		Length: 4 << 10,
+		Parent: RootInode,
+		Atime:  now.Unix(),
+		Mtime:  now.Unix(),
+		Ctime:  now.Unix(),
+		Full:   true,
+	}
+	// doRepair is an upsert, so two clients racing here both write the same
+	// directory and the later one only refreshes its timestamps. The volume
+	// counters are deliberately not touched: the trash root is not counted
+	// either, and no recount pass walks a root that has no entry to reach it.
+	// recount nlink from the edges rather than trusting the attr, so a racing
+	// creator that already attached snapshots is not clobbered back to 2
+	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
+}
+
+// clearSnapshotFlags returns the flags a copy of a snapshot inode should carry.
+// The freeze belongs to the snapshot, so a copy leaving it must not inherit it,
+// or its flags could never be changed again by anyone.
+func clearSnapshotFlags(flags uint8) uint8 {
+	if flags&FlagSnapshot != 0 {
+		return flags &^ (FlagSnapshot | FlagImmutable)
+	}
+	return flags
+}
+
 func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	if !m.toTrash(parent) {
 		return 0
@@ -3073,7 +3138,9 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	m.Lock()
 	if st != 0 && st != syscall.EEXIST {
 		logger.Warnf("create subTrash %s: %s", name, st)
-	} else if *trash <= TrashInode {
+	} else if *trash <= TrashInode || !trash.IsTrash() {
+		// the upper bound matters since the trash range is bounded by SnapshotInode:
+		// a nextTrash counter that ran past it would hand out snapshot inodes
 		logger.Warnf("invalid trash inode: %d", *trash)
 		st = syscall.EBADF
 	} else {
@@ -3383,7 +3450,7 @@ func (m *baseMeta) ScanDeletedObject(ctx Context, tss trashSliceScan, pss pendin
 
 func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
 
-	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || (parent == RootInode && name == TrashName) {
+	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || isReservedEntry(parent, name) || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 
@@ -3661,6 +3728,11 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	if set&SetAttrFlag != 0 {
+		// a snapshot is frozen for everyone, root included: allowing its flags to
+		// change would let FlagImmutable be cleared and the snapshot rewritten
+		if cur.Flags&FlagSnapshot != 0 && attr.Flags != cur.Flags {
+			return nil, syscall.EPERM
+		}
 		dirtyAttr.Flags = attr.Flags
 		changed = true
 	}

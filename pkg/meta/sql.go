@@ -5501,6 +5501,8 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, attr); eno != 0 {
 			return eno
 		}
+		n.Flags = clearSnapshotFlags(n.Flags)
+		attr.Flags = n.Flags
 
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			n.Uid = ctx.Uid()

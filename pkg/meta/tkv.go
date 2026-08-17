@@ -4471,6 +4471,7 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			return eno
 		}
 		attr.Parent = parent
+		attr.Flags = clearSnapshotFlags(attr.Flags)
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()

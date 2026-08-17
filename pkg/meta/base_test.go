@@ -210,6 +210,8 @@ func testMeta(t *testing.T, m Meta) {
 	testClone(t, m)
 	testCleanupDetachedNodes(t, m)
 	testBatchClone(t, m)
+	testSnapshotFlag(t, m)
+	testSnapshotRoot(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
@@ -4721,6 +4723,168 @@ func checkEntry(t *testing.T, m Meta, srcEntry, dstEntry *Entry, dstParentIno In
 		if !bytes.Equal(v1, v2) {
 			t.Fatalf("xattr not equal")
 		}
+	}
+}
+
+// A snapshot is frozen for everyone, root included: once FlagSnapshot is set the
+// flags of that inode can no longer be changed, so FlagImmutable cannot be cleared
+// and the snapshot cannot be rewritten through it.
+func testSnapshotFlag(t *testing.T, m Meta) {
+	ctx := Background()
+	var inode Ino
+	// Mknod persists the Flags left in the attr it is handed, so every call here
+	// gets a fresh one rather than reusing an attr a GetAttr has filled in
+	if st := m.Mknod(ctx, RootInode, "snapshotFlag", TypeFile, 0644, 022, 0, "", &inode, &Attr{}); st != 0 {
+		t.Fatalf("mknod: %s", st)
+	}
+	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlag", false) }()
+
+	frozen := uint8(FlagImmutable | FlagSnapshot)
+	if st := m.SetAttr(ctx, inode, SetAttrFlag, 0, &Attr{Flags: frozen}); st != 0 {
+		t.Fatalf("freeze: %s", st)
+	}
+
+	// every direction is refused, including as root (Background() is uid 0)
+	for _, flags := range []uint8{0, FlagImmutable, FlagSnapshot, FlagImmutable | FlagAppend | FlagSnapshot} {
+		if st := m.SetAttr(ctx, inode, SetAttrFlag, 0, &Attr{Flags: flags}); st != syscall.EPERM {
+			t.Fatalf("changing flags of a snapshot inode to %d should be EPERM, got %s", flags, st)
+		}
+	}
+	var got Attr
+	if st := m.GetAttr(ctx, inode, &got); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	if got.Flags != frozen {
+		t.Fatalf("flags of a snapshot inode changed: %d != %d", got.Flags, frozen)
+	}
+
+	// a write of the identical flags is not a change, so it stays allowed
+	if st := m.SetAttr(ctx, inode, SetAttrFlag, 0, &Attr{Flags: frozen}); st != 0 {
+		t.Fatalf("rewriting the same flags should be allowed, got %s", st)
+	}
+
+	// a copy leaving the snapshot must not inherit the freeze, or its flags could
+	// never be changed again by anyone
+	var cloned Ino
+	var clonedAttr Attr
+	if st := m.Clone(ctx, RootInode, inode, RootInode, "snapshotFlagClone", CLONE_MODE_PRESERVE_ATTR, 022, 1, new(uint64), new(uint64)); st != 0 {
+		t.Fatalf("clone a frozen file: %s", st)
+	}
+	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlagClone", false) }()
+	if st := m.Lookup(ctx, RootInode, "snapshotFlagClone", &cloned, &clonedAttr, false); st != 0 {
+		t.Fatalf("lookup clone: %s", st)
+	}
+	if clonedAttr.Flags&(FlagSnapshot|FlagImmutable) != 0 {
+		t.Fatalf("clone of a snapshot inode inherited the freeze: %d", clonedAttr.Flags)
+	}
+	if st := m.SetAttr(ctx, cloned, SetAttrFlag, 0, &Attr{Flags: FlagAppend}); st != 0 {
+		t.Fatalf("the clone should still accept flag changes, got %s", st)
+	}
+
+	// and it must not be reachable from the live namespace through a hardlink
+	if st := m.Link(ctx, inode, RootInode, "snapshotFlagLink", &Attr{}); st != syscall.EPERM {
+		t.Fatalf("hardlinking a snapshot inode should be EPERM, got %s", st)
+	}
+
+	// unrelated inodes keep normal flag behaviour
+	var other Ino
+	if st := m.Mknod(ctx, RootInode, "snapshotFlagOther", TypeFile, 0644, 022, 0, "", &other, &Attr{}); st != 0 {
+		t.Fatalf("mknod other: %s", st)
+	}
+	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlagOther", false) }()
+	if st := m.SetAttr(ctx, other, SetAttrFlag, 0, &Attr{Flags: FlagImmutable}); st != 0 {
+		t.Fatalf("set immutable on a normal inode: %s", st)
+	}
+	if st := m.SetAttr(ctx, other, SetAttrFlag, 0, &Attr{Flags: 0}); st != 0 {
+		t.Fatalf("clear immutable on a normal inode: %s", st)
+	}
+}
+
+// .snapshots is resolved by Lookup rather than by a directory entry, exactly like
+// .trash, so it stays out of readdir and cannot be created or removed by hand.
+func testSnapshotRoot(t *testing.T, m Meta) {
+	ctx := Background()
+	base := m.getBase()
+	var inode Ino
+	var attr Attr
+
+	// absent until the first snapshot creates it
+	if st := m.Lookup(ctx, RootInode, SnapshotName, &inode, &attr, false); st != syscall.ENOENT {
+		t.Fatalf("looking up %s before any snapshot should be ENOENT, got %s", SnapshotName, st)
+	}
+
+	if st := base.ensureSnapshotRoot(ctx); st != 0 {
+		t.Fatalf("ensure snapshot root: %s", st)
+	}
+	if st := base.ensureSnapshotRoot(ctx); st != 0 {
+		t.Fatalf("ensure snapshot root is not idempotent: %s", st)
+	}
+
+	if st := m.Lookup(ctx, RootInode, SnapshotName, &inode, &attr, false); st != 0 {
+		t.Fatalf("lookup %s: %s", SnapshotName, st)
+	}
+	if inode != SnapshotInode {
+		t.Fatalf("%s resolved to %d, want %d", SnapshotName, inode, SnapshotInode)
+	}
+	if attr.Typ != TypeDirectory {
+		t.Fatalf("%s should be a directory, got type %d", SnapshotName, attr.Typ)
+	}
+
+	// resolved by name only: there is no entry for it under the root
+	var entries []*Entry
+	if st := m.Readdir(ctx, RootInode, 0, &entries); st != 0 {
+		t.Fatalf("readdir root: %s", st)
+	}
+	for _, e := range entries {
+		if string(e.Name) == SnapshotName {
+			t.Fatalf("%s should not appear in the root listing", SnapshotName)
+		}
+	}
+
+	// the name is reserved under the root
+	var tmp Ino
+	if st := m.Mknod(ctx, RootInode, SnapshotName, TypeFile, 0644, 022, 0, "", &tmp, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("mknod %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Mkdir(ctx, RootInode, SnapshotName, 0777, 022, 0, &tmp, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("mkdir %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Unlink(ctx, RootInode, SnapshotName); st != syscall.EPERM {
+		t.Fatalf("unlink %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Rmdir(ctx, RootInode, SnapshotName); st != syscall.EPERM {
+		t.Fatalf("rmdir %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Rename(ctx, RootInode, SnapshotName, RootInode, "stolen", 0, &tmp, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("renaming %s should be EPERM, got %s", SnapshotName, st)
+	}
+
+	// and nothing can be made inside it through the normal namespace calls
+	if st := m.Mkdir(ctx, SnapshotInode, "byhand", 0777, 022, 0, &tmp, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("mkdir inside %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Mknod(ctx, SnapshotInode, "byhand", TypeFile, 0644, 022, 0, "", &tmp, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("mknod inside %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Rmdir(ctx, SnapshotInode, "anything"); st != syscall.EPERM {
+		t.Fatalf("rmdir inside %s should be EPERM, got %s", SnapshotName, st)
+	}
+	if st := m.Clone(ctx, RootInode, RootInode, SnapshotInode, "byclone", 0, 022, 1, new(uint64), new(uint64)); st != syscall.EPERM {
+		t.Fatalf("cloning into %s should be EPERM, got %s", SnapshotName, st)
+	}
+	// BatchUnlink is on the Meta interface, so it needs its own guard rather than
+	// relying on Unlink having one
+	if st := m.BatchUnlink(ctx, SnapshotInode, []*Entry{{Inode: 2, Name: []byte("x")}}, nil, false); st != syscall.EPERM {
+		t.Fatalf("batch unlink inside %s should be EPERM, got %s", SnapshotName, st)
+	}
+
+	// the root has no entry under / to be found, so path resolution needs the
+	// same fixup the trash root gets
+	if paths := m.GetPaths(ctx, SnapshotInode); len(paths) != 1 || paths[0] != "/"+SnapshotName {
+		t.Fatalf("GetPaths(%s) = %v, want [/%s]", SnapshotName, paths, SnapshotName)
+	}
+	if parents := m.GetParents(ctx, SnapshotInode); len(parents) != 1 || parents[RootInode] != 1 {
+		t.Fatalf("GetParents(%s) = %v, want {1:1}", SnapshotName, parents)
 	}
 }
 

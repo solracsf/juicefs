@@ -555,17 +555,16 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 		}
 	}()
 	var attr = &Attr{}
-	if IsSpecialNode(ino) {
+	// IsSpecialNode is a range test, so it also covers reserved inodes that are
+	// not internal files (the snapshot range); those must open normally instead
+	// of getting an internal handle with no entry behind it
+	if n := getInternalNode(ino); IsSpecialNode(ino) && n != nil {
 		if ino != controlInode && (flags&O_ACCMODE) != syscall.O_RDONLY {
 			err = syscall.EACCES
 			return
 		}
 		h := v.newHandle(ino, true, 0)
 		fh = h.fh
-		n := getInternalNode(ino)
-		if n == nil {
-			return
-		}
 		entry = &meta.Entry{Inode: ino, Attr: n.attr}
 		switch ino {
 		case logInode:

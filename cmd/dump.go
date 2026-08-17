@@ -19,9 +19,11 @@ package cmd
 import (
 	"compress/gzip"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/DataDog/zstd"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -134,6 +136,14 @@ func dumpMeta(m meta.Meta, dst string, threads int, keepSecret, fast, skipTrash,
 				bars[name].IncrBy(cnt)
 			},
 		})
+	}
+	// the JSON dump walks the root and the trash only, so a hidden root that is
+	// reached by name would be dropped without a word; refuse rather than hand
+	// back a backup that is quietly missing data
+	if st := m.GetAttr(meta.Background(), meta.SnapshotInode, &meta.Attr{}); st == 0 {
+		return fmt.Errorf("this volume has snapshots, which the JSON dump cannot represent; use --binary")
+	} else if st != syscall.ENOENT {
+		return fmt.Errorf("check for snapshots: %s", st)
 	}
 	return m.DumpMeta(w, 1, threads, keepSecret, fast, skipTrash)
 }

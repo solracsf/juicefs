@@ -3921,6 +3921,11 @@ func (m *redisMeta) cleanupLeakedInodes(delete bool) {
 			var attr Attr
 			m.parseAttr([]byte(v.(string)), &attr)
 			ino, _ := strconv.Atoi(keys[i][prefix+1:])
+			if Ino(ino).IsSnapshot() {
+				// snapshot roots are reached by name from Lookup, not by a directory
+				// entry, so the scan above never finds them and they are not leaked
+				continue
+			}
 			if _, ok := foundInodes[Ino(ino)]; !ok && time.Unix(attr.Ctime, 0).Before(cutoff) {
 				logger.Infof("found dangling inode: %s %+v", keys[i], attr)
 				if delete {
@@ -5355,6 +5360,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			return eno
 		}
 		attr.Parent = parent
+		attr.Flags = clearSnapshotFlags(attr.Flags)
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()
