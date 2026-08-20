@@ -5361,6 +5361,9 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 		}
 		attr.Parent = parent
 		attr.Flags = clearSnapshotFlags(attr.Flags)
+		if cmode&CLONE_MODE_SNAPSHOT != 0 {
+			attr.Flags |= FlagSnapshot | FlagImmutable
+		}
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()
@@ -5562,7 +5565,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 			if pattr.Typ != TypeDirectory {
 				return syscall.ENOTDIR
 			}
-			if (pattr.Flags & FlagImmutable) != 0 {
+			if (pattr.Flags&FlagImmutable) != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
 				return syscall.EPERM
 			}
 			if st := m.Access(ctx, dstParent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
@@ -5717,6 +5720,10 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				}
 				if info.dstAttr.Typ == TypeFile && info.dstAttr.Nlink > 1 {
 					info.dstAttr.Nlink = 1
+				}
+				info.dstAttr.Flags = clearSnapshotFlags(info.dstAttr.Flags)
+				if cmode&CLONE_MODE_SNAPSHOT != 0 {
+					info.dstAttr.Flags |= FlagSnapshot | FlagImmutable
 				}
 				info.xattr = sd.xattr
 				if info.dstAttr.Typ == TypeFile {

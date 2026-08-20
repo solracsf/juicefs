@@ -60,6 +60,7 @@ func Main(args []string) error {
 			cmdFormat(),
 			cmdConfig(),
 			cmdQuota(),
+			cmdSnapshot(),
 			cmdDestroy(),
 			cmdGC(),
 			cmdFsck(),

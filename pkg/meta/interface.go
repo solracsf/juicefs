@@ -151,6 +151,12 @@ func (i Ino) IsNormal() bool {
 var TrashName = ".trash"
 var SnapshotName = ".snapshots"
 
+// MinSnapshotVersion is the first client version that understands snapshots. It
+// names the dev pre-release so builds from the 1.5.0 line are accepted too.
+// A snapshot is refused while an older client still holds a session, since the
+// format gate at mount cannot reach one that is already running.
+const MinSnapshotVersion = "1.5.0-dev"
+
 // isReservedEntry reports whether name is one of the hidden roots under the volume
 // root. They are resolved by Lookup rather than by a directory entry, so they must
 // never be created, renamed or removed through the normal namespace calls.
@@ -562,6 +568,10 @@ type Meta interface {
 	GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno
 	// GetTreeSummary returns a summary in tree structure
 	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, sortBy TreeSort, updateProgress func(count uint64, bytes uint64)) syscall.Errno
+	// CreateSnapshot freezes a copy of the tree at src under .snapshots/name.
+	CreateSnapshot(ctx Context, src Ino, name string, count, total *uint64) (Ino, syscall.Errno)
+	// ListSnapshots returns every snapshot of this volume.
+	ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno)
 	// Clone a file or directory
 	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno
 	// GetPaths returns all paths of an inode

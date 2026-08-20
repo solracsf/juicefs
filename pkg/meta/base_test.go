@@ -212,6 +212,7 @@ func testMeta(t *testing.T, m Meta) {
 	testBatchClone(t, m)
 	testSnapshotFlag(t, m)
 	testSnapshotRoot(t, m)
+	testSnapshot(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
@@ -4885,6 +4886,128 @@ func testSnapshotRoot(t *testing.T, m Meta) {
 	}
 	if parents := m.GetParents(ctx, SnapshotInode); len(parents) != 1 || parents[RootInode] != 1 {
 		t.Fatalf("GetParents(%s) = %v, want {1:1}", SnapshotName, parents)
+	}
+}
+
+// A snapshot is a frozen metadata copy that shares its data with the original.
+func testSnapshot(t *testing.T, m Meta) {
+	ctx := Background()
+	var src, sub, file Ino
+	if st := m.Mkdir(ctx, RootInode, "snapSrc", 0777, 022, 0, &src, &Attr{}); st != 0 {
+		t.Fatalf("mkdir snapSrc: %s", st)
+	}
+	if st := m.Mkdir(ctx, src, "sub", 0777, 022, 0, &sub, &Attr{}); st != 0 {
+		t.Fatalf("mkdir sub: %s", st)
+	}
+	if st := m.Create(ctx, sub, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+		t.Fatalf("create f: %s", st)
+	}
+	// one slice of real data, so the snapshot has something to pin
+	if st := m.Write(ctx, file, 0, 0, Slice{Id: 200001, Size: 100, Len: 100}, time.Now()); st != 0 {
+		t.Fatalf("write f: %s", st)
+	}
+
+	var count, total uint64
+	root, st := m.CreateSnapshot(ctx, src, "snap1", &count, &total)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	if !root.IsSnapshot() {
+		t.Fatalf("snapshot root %d is outside the reserved range", root)
+	}
+	if count != 3 || total != 3 {
+		t.Fatalf("snapshot copied %d of %d entries, want 3 of 3", count, total)
+	}
+
+	// reachable by path, and every copied inode is frozen
+	var got Ino
+	var attr Attr
+	if st := m.Lookup(ctx, SnapshotInode, "snap1", &got, &attr, false); st != 0 {
+		t.Fatalf("lookup snapshot: %s", st)
+	}
+	if got != root {
+		t.Fatalf("snapshot resolved to %d, want %d", got, root)
+	}
+	var snapSub, snapFile Ino
+	if st := m.Lookup(ctx, root, "sub", &snapSub, &attr, false); st != 0 {
+		t.Fatalf("lookup sub in snapshot: %s", st)
+	}
+	if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable {
+		t.Fatalf("snapshot dir is not frozen: %d", attr.Flags)
+	}
+	if st := m.Lookup(ctx, snapSub, "f", &snapFile, &attr, false); st != 0 {
+		t.Fatalf("lookup f in snapshot: %s", st)
+	}
+	if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable {
+		t.Fatalf("snapshot file is not frozen: %d", attr.Flags)
+	}
+	if snapFile == file {
+		t.Fatalf("snapshot should copy the inode, not alias it")
+	}
+
+	// frozen means frozen: no write, no flag change, no unlink
+	if st := m.Open(ctx, snapFile, syscall.O_WRONLY, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("opening a snapshot file for write should be EPERM, got %s", st)
+	}
+	if st := m.SetAttr(ctx, snapFile, SetAttrFlag, 0, &Attr{Flags: 0}); st != syscall.EPERM {
+		t.Fatalf("unfreezing a snapshot file should be EPERM, got %s", st)
+	}
+	if st := m.Unlink(ctx, snapSub, "f"); st != syscall.EPERM {
+		t.Fatalf("unlinking inside a snapshot should be EPERM, got %s", st)
+	}
+
+	// the data is shared, so the slice must still be referenced after the
+	// original is deleted: this is what keeps gc from freeing the blocks
+	if st := m.Unlink(ctx, sub, "f"); st != 0 {
+		t.Fatalf("unlink original: %s", st)
+	}
+	var refs int
+	found := false
+	if st := m.ScanSlices(ctx, &ScanSlicesOption{}, func(ino Ino, s Slice) error {
+		if s.Id == 200001 {
+			found = true
+			refs++
+		}
+		return nil
+	}); st != 0 {
+		t.Fatalf("scan slices: %s", st)
+	}
+	if !found {
+		t.Fatalf("the snapshot's slice is not in the live set, gc would free its blocks")
+	}
+
+	// listing, and names are unique
+	snaps, st := m.ListSnapshots(ctx)
+	if st != 0 {
+		t.Fatalf("list snapshots: %s", st)
+	}
+	if len(snaps) != 1 || snaps[0].Name != "snap1" || snaps[0].Inode != root {
+		t.Fatalf("ListSnapshots = %+v, want one entry named snap1", snaps)
+	}
+	if _, st := m.CreateSnapshot(ctx, src, "snap1", nil, nil); st != syscall.EEXIST {
+		t.Fatalf("a duplicate snapshot name should be EEXIST, got %s", st)
+	}
+
+	// only directories, and never of a reserved tree
+	var plain Ino
+	if st := m.Create(ctx, src, "plain", 0644, 022, 0, &plain, &Attr{}); st != 0 {
+		t.Fatalf("create plain: %s", st)
+	}
+	if _, st := m.CreateSnapshot(ctx, plain, "ofafile", nil, nil); st != syscall.ENOTDIR {
+		t.Fatalf("snapshotting a file should be ENOTDIR, got %s", st)
+	}
+	// snapshots are taken of live state only: no snapshot-owned inode is a
+	// source, whatever path reaches it
+	for name, ino := range map[string]Ino{"the snapshot tree": SnapshotInode, "a snapshot": root, "a snapshot dir": snapSub} {
+		if _, st := m.CreateSnapshot(ctx, ino, "ofsnapshot", nil, nil); st != syscall.EPERM {
+			t.Fatalf("snapshotting %s should be EPERM, got %s", name, st)
+		}
+	}
+	if st := m.Link(ctx, snapFile, src, "linked", &Attr{}); st != syscall.EPERM {
+		t.Fatalf("linking a snapshot file into the live tree should be EPERM, got %s", st)
+	}
+	if _, st := m.CreateSnapshot(ctx, TrashInode, "oftrash", nil, nil); st != syscall.EPERM {
+		t.Fatalf("snapshotting the trash should be EPERM, got %s", st)
 	}
 }
 

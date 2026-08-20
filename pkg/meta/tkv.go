@@ -4472,6 +4472,9 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		}
 		attr.Parent = parent
 		attr.Flags = clearSnapshotFlags(attr.Flags)
+		if cmode&CLONE_MODE_SNAPSHOT != 0 {
+			attr.Flags |= FlagSnapshot | FlagImmutable
+		}
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()
@@ -4642,7 +4645,7 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
 		}
-		if (pattr.Flags & FlagImmutable) != 0 {
+		if (pattr.Flags&FlagImmutable) != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
 			return syscall.EPERM
 		}
 		if eno := m.Access(ctx, dstParent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
@@ -4703,6 +4706,10 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			if attr.Typ == TypeFile && attr.Nlink > 1 {
 				attr.Nlink = 1
+			}
+			attr.Flags = clearSnapshotFlags(attr.Flags)
+			if cmode&CLONE_MODE_SNAPSHOT != 0 {
+				attr.Flags |= FlagSnapshot | FlagImmutable
 			}
 
 			// check entry does not exist

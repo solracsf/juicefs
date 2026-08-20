@@ -5460,7 +5460,7 @@ func isDuplicateEntryErr(err error) bool {
 	return false
 }
 
-func (m *dbMeta) validateCloneTarget(ctx Context, s xorm.Interface, ino Ino) (node, error) {
+func (m *dbMeta) validateCloneTarget(ctx Context, s xorm.Interface, ino Ino, cmode uint8) (node, error) {
 	pn := node{Inode: ino}
 	ok, err := s.Get(&pn)
 	if err != nil {
@@ -5472,7 +5472,9 @@ func (m *dbMeta) validateCloneTarget(ctx Context, s xorm.Interface, ino Ino) (no
 	if pn.Type != TypeDirectory {
 		return pn, syscall.ENOTDIR
 	}
-	if (pn.Flags & FlagImmutable) != 0 {
+	// a snapshot freezes each directory as it is created, so its own children
+	// still have to be written into it
+	if (pn.Flags&FlagImmutable) != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
 		return pn, syscall.EPERM
 	}
 	var pattr Attr
@@ -5502,6 +5504,9 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			return eno
 		}
 		n.Flags = clearSnapshotFlags(n.Flags)
+		if cmode&CLONE_MODE_SNAPSHOT != 0 {
+			n.Flags |= FlagSnapshot | FlagImmutable
+		}
 		attr.Flags = n.Flags
 
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
@@ -5519,7 +5524,7 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		}
 
 		if top {
-			pn, err := m.validateCloneTarget(ctx, s, parent)
+			pn, err := m.validateCloneTarget(ctx, s, parent, cmode)
 			if err != nil {
 				return err
 			}
@@ -5615,7 +5620,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	if len(entries) == 0 {
 		return 0
 	}
-	if _, err := m.validateCloneTarget(ctx, m.db, dstParent); err != nil {
+	if _, err := m.validateCloneTarget(ctx, m.db, dstParent, cmode); err != nil {
 		return errno(err)
 	}
 
@@ -5645,7 +5650,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		nowNano := time.Now().UnixNano()
 		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
 
-		if _, err := m.validateCloneTarget(ctx, s, dstParent); err != nil {
+		if _, err := m.validateCloneTarget(ctx, s, dstParent, cmode); err != nil {
 			return err
 		}
 
@@ -5690,6 +5695,10 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			if sn.Type == TypeFile && sn.Nlink > 1 {
 				info.dstNode.Nlink = 1
+			}
+			info.dstNode.Flags = clearSnapshotFlags(info.dstNode.Flags)
+			if cmode&CLONE_MODE_SNAPSHOT != 0 {
+				info.dstNode.Flags |= FlagSnapshot | FlagImmutable
 			}
 
 			nodesIns = append(nodesIns, &info.dstNode)

@@ -59,6 +59,7 @@ const (
 	// clone mode
 	CLONE_MODE_CAN_OVERWRITE      = 0x01
 	CLONE_MODE_PRESERVE_ATTR      = 0x02
+	CLONE_MODE_SNAPSHOT           = 0x04 // freeze every copied inode
 	CLONE_MODE_PRESERVE_HARDLINKS = 0x08
 
 	// clone concurrency

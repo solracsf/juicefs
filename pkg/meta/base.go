@@ -106,6 +106,7 @@ type engine interface {
 	doCleanupDetachedNode(ctx Context, detachedNode Ino) syscall.Errno
 
 	doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error
+	ListSessions() ([]*Session, error)
 
 	doGetQuota(ctx Context, qtype uint32, key uint64) (*Quota, error)
 	// set quota, return true if there is no quota exists before
@@ -3103,6 +3104,145 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
 }
 
+// SnapshotInfo describes one snapshot under the hidden .snapshots root.
+type SnapshotInfo struct {
+	Inode   Ino
+	Name    string
+	Created time.Time
+}
+
+// checkSnapshotSessions refuses to freeze a tree while a client too old to
+// understand snapshots is still mounted. The format gate only runs at mount, so
+// a session that started earlier keeps serving and could still be asked to
+// compact or rmr a frozen tree.
+func (m *baseMeta) checkSnapshotSessions(ctx Context) syscall.Errno {
+	sessions, err := m.en.ListSessions()
+	if err != nil {
+		logger.Warnf("list sessions: %s", err)
+		return errno(err)
+	}
+	minVer := version.Parse(MinSnapshotVersion)
+	for _, s := range sessions {
+		if s.Version == "" {
+			continue
+		}
+		if r, e := version.CompareVersions(version.Parse(s.Version), minVer); e == nil && r < 0 {
+			logger.Errorf("client %d on %s runs %s, which predates snapshot support", s.Sid, s.HostName, s.Version)
+			return syscall.EPERM
+		}
+	}
+	return 0
+}
+
+// CreateSnapshot freezes a copy of the tree at src under .snapshots/name. The
+// copy shares its data with the original: only metadata is written.
+func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, total *uint64) (Ino, syscall.Errno) {
+	if m.conf.ReadOnly {
+		return 0, syscall.EROFS
+	}
+	if st := checkInodeName(name); st != 0 {
+		return 0, st
+	}
+	if name == "." || name == ".." {
+		return 0, syscall.EINVAL
+	}
+	src = m.checkRoot(src)
+	if !src.IsValid() || src.IsTrash() || src.IsSnapshot() {
+		return 0, syscall.EPERM
+	}
+
+	var srcAttr Attr
+	if st := m.en.doGetAttr(ctx, src, &srcAttr); st != 0 {
+		return 0, st
+	}
+	if srcAttr.Flags&FlagSnapshot != 0 {
+		return 0, syscall.EPERM
+	}
+	if srcAttr.Typ != TypeDirectory {
+		return 0, syscall.ENOTDIR
+	}
+	if st := m.Access(ctx, src, MODE_MASK_R|MODE_MASK_X, &srcAttr); st != 0 {
+		return 0, st
+	}
+	if st := m.checkSnapshotSessions(ctx); st != 0 {
+		return 0, st
+	}
+	if st := m.ensureSnapshotRoot(ctx); st != 0 {
+		return 0, st
+	}
+
+	var exist Ino
+	if st := m.en.doLookup(ctx, SnapshotInode, name, &exist, nil); st == 0 {
+		return 0, syscall.EEXIST
+	} else if st != syscall.ENOENT {
+		return 0, st
+	}
+
+	var sum Summary
+	if st := m.GetSummary(ctx, src, &sum, true, false); st != 0 {
+		return 0, st
+	}
+	if total != nil {
+		*total = sum.Dirs + sum.Files
+	}
+
+	next, err := m.en.incrCounter("nextSnapshot", 1)
+	if err != nil {
+		return 0, errno(err)
+	}
+	root := SnapshotInode + Ino(next)
+	if !root.IsSnapshot() {
+		logger.Errorf("snapshot counter %d is out of range", next)
+		return 0, syscall.ENOSPC
+	}
+
+	if count == nil {
+		count = new(uint64)
+	}
+	cmode := uint8(CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_SNAPSHOT)
+	concurrent := make(chan struct{}, CLONE_DEFAULT_CONCURRENCY)
+	dst := root
+	// built detached, so an interrupted snapshot is reaped by the background
+	// cleanup instead of being left half visible under .snapshots
+	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, concurrent)
+	if st == 0 {
+		st = m.en.doAttachDirNode(ctx, SnapshotInode, root, name)
+	}
+	if st != 0 {
+		if eno := m.en.doCleanupDetachedNode(ctx, root); eno != 0 {
+			logger.Errorf("remove partial snapshot %d: %s", root, eno)
+		}
+		return 0, st
+	}
+	return root, 0
+}
+
+// ListSnapshots returns the snapshots under the hidden root, by name.
+func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
+	if st := m.en.doGetAttr(ctx, SnapshotInode, nil); st == syscall.ENOENT {
+		return nil, 0 // no snapshot has ever been taken
+	} else if st != 0 {
+		return nil, st
+	}
+	var entries []*Entry
+	if st := m.en.doReaddir(ctx, SnapshotInode, 1, &entries, -1); st != 0 && st != syscall.ENOENT {
+		return nil, st
+	}
+	snaps := make([]*SnapshotInfo, 0, len(entries))
+	for _, e := range entries {
+		if n := string(e.Name); n == "." || n == ".." {
+			continue
+		}
+		info := &SnapshotInfo{Inode: e.Inode, Name: string(e.Name)}
+		if e.Attr != nil {
+			info.Created = time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec))
+		}
+		snaps = append(snaps, info)
+	}
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Name < snaps[j].Name })
+	return snaps, 0
+}
+
 // clearSnapshotFlags returns the flags a copy of a snapshot inode should carry.
 // The freeze belongs to the snapshot, so a copy leaving it must not inherit it,
 // or its flags could never be changed again by anyone.
@@ -3516,12 +3656,19 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 }
 
 func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, dstIno *Ino, cmode uint8, cumask uint16, count *uint64, top bool, concurrent chan struct{}) syscall.Errno {
-	ino, err := m.nextInode()
-	if err != nil {
-		return errno(err)
-	}
-	if dstIno != nil {
-		*dstIno = ino
+	// a caller that has already reserved the destination inode passes it in;
+	// snapshots need their root to come from the reserved range
+	var ino Ino
+	if dstIno != nil && *dstIno != 0 {
+		ino = *dstIno
+	} else {
+		var err error
+		if ino, err = m.nextInode(); err != nil {
+			return errno(err)
+		}
+		if dstIno != nil {
+			*dstIno = ino
+		}
 	}
 	var attr Attr
 	eno := m.en.doCloneEntry(ctx, srcIno, parent, name, ino, &attr, cmode, cumask, top)
