@@ -22,6 +22,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
@@ -36,7 +37,8 @@ func cmdSnapshot() *cli.Command {
 		Description: `
 A snapshot is a frozen copy of a directory tree. It copies metadata only, so it
 is fast and shares its data with the original, but it does consume inodes and
-metadata space. Snapshots are read-only and live under /.snapshots.
+metadata space. Snapshots are read-only and live under /.snapshots. They are
+not counted against the volume capacity or any quota; "list" reports their usage.
 
 Examples:
 # Snapshot the whole volume
@@ -144,11 +146,21 @@ func snapshotList(c *cli.Context) error {
 		logger.Infof("no snapshot")
 		return nil
 	}
+	// snapshots are not charged against capacity or quotas, so this is where their
+	// usage shows up; they are immutable, so the figures cannot go stale
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "NAME\tCREATED\tPATH")
+	_, _ = fmt.Fprintln(w, "NAME\tCREATED\tINODES\tSIZE\tPATH")
+	var inodes, size uint64
 	for _, s := range snaps {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t/%s/%s\n", s.Name,
-			s.Created.Format(time.RFC3339), meta.SnapshotName, s.Name)
+		var sum meta.Summary
+		if st := m.GetSummary(meta.Background(), s.Inode, &sum, true, false); st != 0 {
+			return fmt.Errorf("summary of snapshot %s: %s", s.Name, st)
+		}
+		inodes += sum.Dirs + sum.Files
+		size += sum.Size
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%s\t/%s/%s\n", s.Name, s.Created.Format(time.RFC3339),
+			sum.Dirs+sum.Files, humanize.IBytes(sum.Size), meta.SnapshotName, s.Name)
 	}
+	_, _ = fmt.Fprintf(w, "(%d snapshots)\t\t%d\t%s\t\n", len(snaps), inodes, humanize.IBytes(size))
 	return w.Flush()
 }

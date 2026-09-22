@@ -5434,8 +5434,10 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 
 		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Set(ctx, m.inodeKey(ino), m.marshal(&attr), 0)
-			p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
-			p.Incr(ctx, m.totalInodesKey())
+			if cmode&CLONE_MODE_SNAPSHOT == 0 {
+				p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
+				p.Incr(ctx, m.totalInodesKey())
+			}
 			if len(srcXattr) > 0 {
 				p.HMSet(ctx, m.xattrKey(ino), srcXattr)
 			}
@@ -5798,10 +5800,10 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 						p.Set(ctx, m.symKey(info.dstIno), sd.sym, 0)
 					}
 				}
-				if batchResult.space != 0 {
+				if batchResult.space != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
 					p.IncrBy(ctx, m.usedSpaceKey(), batchResult.space)
 				}
-				if batchResult.inodes != 0 {
+				if batchResult.inodes != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
 					p.IncrBy(ctx, m.totalInodesKey(), batchResult.inodes)
 				}
 				for field, delta := range refDelta {

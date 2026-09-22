@@ -539,7 +539,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 				e.Parents = append(parents[inode], parent)
 				parents[inode] = e.Parents
 				if len(e.Parents) == 1 {
-					if inode > 1 && inode != TrashInode && inode != SnapshotInode {
+					if inode > 1 && inode != TrashInode && inode != SnapshotInode && e.Attr.Flags&FlagSnapshot == 0 {
 						cs.UsedSpace += align4K(e.Attr.Length)
 						cs.UsedInodes += 1
 					}

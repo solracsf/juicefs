@@ -4909,10 +4909,38 @@ func testSnapshot(t *testing.T, m Meta) {
 		t.Fatalf("write f: %s", st)
 	}
 
+	var totalSpace, availSpace, iused, iavail uint64
+	m.getBase().doFlushStats()
+	if st := m.StatFS(ctx, RootInode, &totalSpace, &availSpace, &iused, &iavail); st != 0 {
+		t.Fatalf("statfs: %s", st)
+	}
+	usedSpace, usedInodes := totalSpace-availSpace, iused
 	var count, total uint64
 	root, st := m.CreateSnapshot(ctx, src, "snap1", &count, &total)
 	if st != 0 {
 		t.Fatalf("create snapshot: %s", st)
+	}
+	// snapshots are not charged against the volume, so df does not move
+	m.getBase().doFlushStats()
+	if st := m.StatFS(ctx, RootInode, &totalSpace, &availSpace, &iused, &iavail); st != 0 {
+		t.Fatalf("statfs: %s", st)
+	}
+	if totalSpace-availSpace != usedSpace || iused != usedInodes {
+		t.Fatalf("snapshot was charged: space %d -> %d, inodes %d -> %d",
+			usedSpace, totalSpace-availSpace, usedInodes, iused)
+	}
+	// snapshot list reports usage from the snapshot's own summary
+	for _, strict := range []bool{false, true} {
+		var want, got Summary
+		if st := m.GetSummary(ctx, src, &want, true, strict); st != 0 {
+			t.Fatalf("summary of source: %s", st)
+		}
+		if st := m.GetSummary(ctx, root, &got, true, strict); st != 0 {
+			t.Fatalf("summary of snapshot: %s", st)
+		}
+		if got != want {
+			t.Fatalf("snapshot summary (strict %v) %+v, want %+v", strict, got, want)
+		}
 	}
 	if !root.IsSnapshot() {
 		t.Fatalf("snapshot root %d is outside the reserved range", root)

@@ -502,8 +502,10 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 			recordInode(node.Inode)
 			if Ino(node.Inode) != RootInode && Ino(node.Inode) != TrashInode && Ino(node.Inode) != SnapshotInode {
 				attr.Unmarshal(node.Data)
-				c.UsedSpace += align4K(attr.Length)
-				c.UsedInodes++
+				if attr.Flags&FlagSnapshot == 0 {
+					c.UsedSpace += align4K(attr.Length)
+					c.UsedInodes++
+				}
 			}
 		}
 	case segTypeChunk:

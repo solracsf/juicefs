@@ -1910,10 +1910,12 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	var r batchCloneResult
 	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &r)
 	if st == 0 {
-		m.en.updateStats(r.space, r.inodes)
-		m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
-		for _, q := range r.deltas {
-			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+		if cmode&CLONE_MODE_SNAPSHOT == 0 {
+			m.en.updateStats(r.space, r.inodes)
+			m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
+			for _, q := range r.deltas {
+				m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+			}
 		}
 		if count != nil {
 			atomic.AddUint64(count, uint64(r.inodes))
@@ -3684,9 +3686,12 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	if eno != 0 {
 		return eno
 	}
-	m.en.updateStats(align4K(attr.Length), 1)
+	// snapshots are exempt from capacity and quotas; snapshot list reports them
+	if cmode&CLONE_MODE_SNAPSHOT == 0 {
+		m.en.updateStats(align4K(attr.Length), 1)
+		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
+	}
 	atomic.AddUint64(count, 1)
-	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
 	if attr.Typ != TypeDirectory {
 		return 0
 	}
@@ -3787,6 +3792,13 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 	if eno == 0 && cloneCtx.Canceled() {
 		eno = syscall.EINTR
+	}
+	// the stat row copied from the source can lag behind its buffered updates,
+	// and a frozen directory would keep that wrong figure for good
+	if eno == 0 && cmode&CLONE_MODE_SNAPSHOT != 0 && m.getFormat().DirStats {
+		if _, st := m.en.doSyncDirStat(ctx, ino); st != 0 {
+			logger.Warnf("sync dir stat of snapshot directory %d: %s", ino, st)
+		}
 	}
 
 	if eno == 0 && nlink != attr.Nlink {
