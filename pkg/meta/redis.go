@@ -5001,7 +5001,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 		dels = append(dels, &DumpedDelFile{Ino(inode), length, int64(z.Score)})
 	}
 
-	names := []string{usedSpace, totalInodes, "nextinode", "nextchunk", "nextsession", "nextTrash"}
+	names := []string{usedSpace, totalInodes, "nextinode", "nextchunk", "nextsession", "nextTrash", "nextSnapshot"}
 	for i := range names {
 		names[i] = m.prefix + names[i]
 	}
@@ -5051,6 +5051,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 			NextChunk:     cs[3] + 1,
 			NextSession:   cs[4],
 			NextTrash:     cs[5],
+			NextSnapshot:  cs[6],
 			LastChangelog: lastChangelog,
 		},
 		Sustained:   sessions,
@@ -5121,6 +5122,28 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 		}
 		if err = m.dumpDir(TrashInode, trash, bw, 1, threads, showProgress); err != nil {
 			return err
+		}
+	}
+	if root == RootInode {
+		if n, err := m.rdb.Exists(ctx, m.inodeKey(SnapshotInode)).Result(); err != nil {
+			return err
+		} else if n > 0 {
+			snaps := &DumpedEntry{
+				Name: "Snapshots",
+				Attr: &DumpedAttr{
+					Inode: SnapshotInode,
+					Type:  typeToString(TypeDirectory),
+				},
+			}
+			if err = m.dumpEntries(snaps); err != nil {
+				return err
+			}
+			if _, err = bw.WriteString(","); err != nil {
+				return err
+			}
+			if err = m.dumpDir(SnapshotInode, snaps, bw, 1, threads, showProgress); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err = bw.WriteString("\n}\n"); err != nil {
@@ -5264,6 +5287,7 @@ func (m *redisMeta) LoadMeta(r io.Reader) (err error) {
 	cs[m.prefix+"nextchunk"] = counters.NextChunk - 1
 	cs[m.prefix+"nextsession"] = counters.NextSession
 	cs[m.prefix+"nextTrash"] = counters.NextTrash
+	cs[m.prefix+"nextSnapshot"] = counters.NextSnapshot
 	p.MSet(ctx, cs)
 	if l := len(dm.DelFiles); l > 0 {
 		if l > 100 {

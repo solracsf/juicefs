@@ -5019,7 +5019,7 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 
 	progress := utils.NewProgress(false)
 	defer progress.Done()
-	var tree, trash *DumpedEntry
+	var tree, trash, snaps *DumpedEntry
 	root = m.checkRoot(root)
 	return m.roTxn(Background(), func(s *xorm.Session) error {
 		var lastChangelog int64
@@ -5054,6 +5054,9 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 			if !skipTrash {
 				trash = m.dumpEntryFast(TrashInode, TypeDirectory)
 			}
+			if _, ok := m.snap.node[SnapshotInode]; ok {
+				snaps = m.dumpEntryFast(SnapshotInode, TypeDirectory)
+			}
 		} else {
 			tree = &DumpedEntry{
 				Name: "FSTree",
@@ -5075,6 +5078,21 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				}
 				if err = m.dumpEntry(s, TrashInode, TypeDirectory, trash, nil); err != nil {
 					return err
+				}
+			}
+			if root == RootInode {
+				if ok, err := s.Exist(&node{Inode: SnapshotInode}); err != nil {
+					return err
+				} else if ok {
+					snaps = &DumpedEntry{
+						Attr: &DumpedAttr{
+							Inode: SnapshotInode,
+							Type:  typeToString(TypeDirectory),
+						},
+					}
+					if err = m.dumpEntry(s, SnapshotInode, TypeDirectory, snaps, nil); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -5111,6 +5129,8 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				counters.NextSession = row.Value
 			case "nextTrash":
 				counters.NextTrash = row.Value
+			case "nextSnapshot":
+				counters.NextSnapshot = row.Value
 			}
 		}
 		counters.LastChangelog = lastChangelog
@@ -5236,6 +5256,21 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				if err = m.dumpDir(s, TrashInode, trash, bw, 1, threads, showProgress); err != nil {
 					logger.Errorf("dump trash failed: %s", err)
 					return fmt.Errorf("dump trash failed") // don't retry
+				}
+			}
+		}
+		if snaps != nil {
+			snaps.Name = "Snapshots"
+			if _, err = bw.WriteString(","); err != nil {
+				return err
+			}
+			if m.snap != nil {
+				_ = m.dumpDirFast(SnapshotInode, snaps, bw, 1, showProgress)
+			} else {
+				showProgress(int64(len(snaps.Entries)), 0)
+				if err = m.dumpDir(s, SnapshotInode, snaps, bw, 1, threads, showProgress); err != nil {
+					logger.Errorf("dump snapshots failed: %s", err)
+					return fmt.Errorf("dump snapshots failed") // don't retry
 				}
 			}
 		}
@@ -5409,6 +5444,7 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 	chs[5] <- &counter{"nextChunk", counters.NextChunk}
 	chs[5] <- &counter{"nextSession", counters.NextSession}
 	chs[5] <- &counter{"nextTrash", counters.NextTrash}
+	chs[5] <- &counter{"nextSnapshot", counters.NextSnapshot}
 	for _, d := range dm.DelFiles {
 		chs[5] <- &delfile{d.Inode, d.Length, d.Expire}
 	}

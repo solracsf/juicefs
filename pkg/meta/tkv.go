@@ -4004,7 +4004,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 
 	progress := utils.NewProgress(false)
 	defer progress.Done()
-	var tree, trash *DumpedEntry
+	var tree, trash, snaps *DumpedEntry
 	root = m.checkRoot(root)
 
 	bInodes, _ := m.get(m.counterKey(totalInodes))
@@ -4103,6 +4103,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				m.snap[TrashInode] = trash
 			}
 		}
+		snaps = m.snap[SnapshotInode]
 	} else {
 		tree = &DumpedEntry{
 			Attr: &DumpedAttr{
@@ -4124,6 +4125,21 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				return err
 			}
 		}
+		if root == RootInode {
+			if st := m.doGetAttr(ctx, SnapshotInode, nil); st == 0 {
+				snaps = &DumpedEntry{
+					Attr: &DumpedAttr{
+						Inode: SnapshotInode,
+						Type:  "directory",
+					},
+				}
+				if err = m.dumpEntry(SnapshotInode, snaps, nil); err != nil {
+					return err
+				}
+			} else if st != syscall.ENOENT {
+				return st
+			}
+		}
 	}
 
 	if tree == nil || tree.Attr == nil {
@@ -4138,7 +4154,8 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 			m.counterKey("nextInode"),
 			m.counterKey("nextChunk"),
 			m.counterKey("nextSession"),
-			m.counterKey("nextTrash"))
+			m.counterKey("nextTrash"),
+			m.counterKey("nextSnapshot"))
 		return nil
 	})
 	if err != nil {
@@ -4222,6 +4239,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 			NextChunk:     cs[3],
 			NextSession:   cs[4],
 			NextTrash:     cs[5],
+			NextSnapshot:  cs[6],
 			LastChangelog: lastChangelog,
 		},
 		Sustained:   sessions,
@@ -4285,6 +4303,22 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 		} else {
 			showProgress(int64(len(tree.Entries)), 0)
 			if err = m.dumpDir(ctx, TrashInode, trash, bw, 1, threads, showProgress); err != nil {
+				return err
+			}
+		}
+	}
+	if snaps != nil {
+		snaps.Name = "Snapshots"
+		if _, err = bw.WriteString(","); err != nil {
+			return err
+		}
+		if m.snap != nil {
+			if err = m.dumpDirFast(SnapshotInode, snaps, bw, 1, showProgress); err != nil {
+				return err
+			}
+		} else {
+			showProgress(int64(len(snaps.Entries)), 0)
+			if err = m.dumpDir(ctx, SnapshotInode, snaps, bw, 1, threads, showProgress); err != nil {
 				return err
 			}
 		}
@@ -4421,6 +4455,7 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 	kv <- &pair{m.counterKey("nextChunk"), packCounter(counters.NextChunk)}
 	kv <- &pair{m.counterKey("nextSession"), packCounter(counters.NextSession)}
 	kv <- &pair{m.counterKey("nextTrash"), packCounter(counters.NextTrash)}
+	kv <- &pair{m.counterKey("nextSnapshot"), packCounter(counters.NextSnapshot)}
 	for _, d := range dm.DelFiles {
 		kv <- &pair{m.delfileKey(d.Inode, d.Length), m.packInt64(d.Expire)}
 	}

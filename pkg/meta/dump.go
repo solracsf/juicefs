@@ -42,6 +42,7 @@ type DumpedCounters struct {
 	NextChunk         int64 `json:"nextChunk"`
 	NextSession       int64 `json:"nextSession"`
 	NextTrash         int64 `json:"nextTrash"`
+	NextSnapshot      int64 `json:"nextSnapshot,omitempty"`
 	NextCleanupSlices int64 `json:"nextCleanupSlices,omitempty"` // deprecated, always 0
 	LastChangelog     int64 `json:"lastChangelog,omitempty"`
 }
@@ -342,6 +343,7 @@ type DumpedMeta struct {
 	ChangeLog   []*DumpedChangeLog      `json:",omitempty"`
 	FSTree      *DumpedEntry            `json:",omitempty"`
 	Trash       *DumpedEntry            `json:",omitempty"`
+	Snapshots   *DumpedEntry            `json:",omitempty"`
 }
 
 func (dm *DumpedMeta) validate() error {
@@ -352,7 +354,7 @@ func (dm *DumpedMeta) validate() error {
 }
 
 func (dm *DumpedMeta) writeJsonWithOutTree(w io.Writer) (*bufio.Writer, error) {
-	if dm.FSTree != nil || dm.Trash != nil {
+	if dm.FSTree != nil || dm.Trash != nil || dm.Snapshots != nil {
 		return nil, fmt.Errorf("invalid dumped meta")
 	}
 	data, err := json.MarshalIndent(dm, "", jsonIndent)
@@ -489,7 +491,7 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 			err = dec.Decode(&dm.ChangeLog)
 		case "FSTree":
 			_, err = decodeEntry(dec, 0, counters, parents, dm.Quotas, refs, bar, load, addChunk)
-		case "Trash":
+		case "Trash", "Snapshots":
 			_, err = decodeEntry(dec, 1, counters, parents, nil, refs, bar, load, addChunk)
 		}
 		if err != nil {
@@ -537,7 +539,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 				e.Parents = append(parents[inode], parent)
 				parents[inode] = e.Parents
 				if len(e.Parents) == 1 {
-					if inode > 1 && inode != TrashInode {
+					if inode > 1 && inode != TrashInode && inode != SnapshotInode {
 						cs.UsedSpace += align4K(e.Attr.Length)
 						cs.UsedInodes += 1
 					}
@@ -552,6 +554,8 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						if cs.NextTrash < int64(inode-TrashInode) {
 							cs.NextTrash = int64(inode - TrashInode)
 						}
+					} else if cs.NextSnapshot < int64(inode-SnapshotInode) {
+						cs.NextSnapshot = int64(inode - SnapshotInode)
 					}
 				}
 			}
@@ -591,7 +595,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 					if err != nil {
 						break
 					}
-					if e.Attr.Inode < TrashInode && typeFromString(child.Attr.Type) == TypeDirectory {
+					if !e.Attr.Inode.IsTrash() && typeFromString(child.Attr.Type) == TypeDirectory {
 						e.Attr.Nlink++
 					}
 					e.Entries[n.(string)] = &DumpedEntry{

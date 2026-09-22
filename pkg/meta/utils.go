@@ -44,7 +44,7 @@ const (
 	krbTokenCounter = "krbTokenMaxId"
 )
 
-var counterNames = []string{usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash"}
+var counterNames = []string{usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash", "nextSnapshot"}
 
 const (
 	// fallocate

@@ -188,6 +188,11 @@ func testMeta(t *testing.T, m Meta) {
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
 	testCopyFileRange(t, m)
+	testSnapshotFlag(t, m)
+	testSnapshotRoot(t, m)
+	testSnapshot(t, m)
+	testSnapshotLeakedInodes(t, m)
+	testSnapshotCompact(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
 	testAttrFlags(t, m)
@@ -210,9 +215,6 @@ func testMeta(t *testing.T, m Meta) {
 	testClone(t, m)
 	testCleanupDetachedNodes(t, m)
 	testBatchClone(t, m)
-	testSnapshotFlag(t, m)
-	testSnapshotRoot(t, m)
-	testSnapshot(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
@@ -5008,6 +5010,162 @@ func testSnapshot(t *testing.T, m Meta) {
 	}
 	if _, st := m.CreateSnapshot(ctx, TrashInode, "oftrash", nil, nil); st != syscall.EPERM {
 		t.Fatalf("snapshotting the trash should be EPERM, got %s", st)
+	}
+}
+
+// The snapshot root has no directory entry, so the leaked-inode sweep cannot
+// reach it by readdir and has to leave the reserved range alone. Redis is the
+// only engine with such a sweep.
+func testSnapshotLeakedInodes(t *testing.T, m Meta) {
+	rm, ok := m.(*redisMeta)
+	if !ok {
+		return
+	}
+	ctx := Background()
+	base := m.getBase()
+	if st := base.ensureSnapshotRoot(ctx); st != 0 {
+		t.Fatalf("ensure snapshot root: %s", st)
+	}
+
+	// the sweep only considers inodes older than an hour, so age the root
+	var attr Attr
+	if st := rm.doGetAttr(ctx, SnapshotInode, &attr); st != 0 {
+		t.Fatalf("getattr snapshot root: %s", st)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	attr.Atime, attr.Mtime, attr.Ctime = old.Unix(), old.Unix(), old.Unix()
+	if st := rm.doRepair(ctx, SnapshotInode, &attr, false); st != 0 {
+		t.Fatalf("age the snapshot root: %s", st)
+	}
+
+	rm.cleanupLeakedInodes(true)
+
+	if st := rm.doGetAttr(ctx, SnapshotInode, &attr); st != 0 {
+		t.Fatalf("gc deleted the snapshot root: %s", st)
+	}
+}
+
+// Compacting a file merges its slices and drops the references the old ones
+// held. A snapshot shares those slices, so its own reference has to keep them
+// alive: without it the snapshot would still list slices whose data was freed.
+func testSnapshotCompact(t *testing.T, m Meta) {
+	c, ok := m.(compactor)
+	if !ok {
+		return
+	}
+	// testCompaction closes the session when it finishes, and compactChunk is a
+	// no-op without a live one
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("new session: %s", err)
+	}
+	defer func() { _ = m.CloseSession() }()
+
+	var l sync.Mutex
+	deleted := make(map[uint64]bool)
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		l.Lock()
+		deleted[args[0].(uint64)] = true
+		l.Unlock()
+		return nil
+	})
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	defer m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+
+	ctx := Background()
+	var dir, file Ino
+	if st := m.Mkdir(ctx, RootInode, "compactSnap", 0777, 022, 0, &dir, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Create(ctx, dir, "frag", 0644, 022, 0, &file, &Attr{}); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	write := func(off uint32) {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			t.Fatalf("new slice: %s", st)
+		}
+		if st := m.Write(ctx, file, 0, off, Slice{Id: id, Size: 1000, Len: 1000}, time.Now()); st != 0 {
+			t.Fatalf("write at %d: %s", off, st)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		write(uint32(i) * 1000)
+	}
+
+	if _, st := m.CreateSnapshot(ctx, dir, "compact-snap", nil, nil); st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	var snapDir, snapFile Ino
+	var attr Attr
+	if st := m.Lookup(ctx, SnapshotInode, "compact-snap", &snapDir, &attr, false); st != 0 {
+		t.Fatalf("lookup snapshot: %s", st)
+	}
+	if st := m.Lookup(ctx, snapDir, "frag", &snapFile, &attr, false); st != 0 {
+		t.Fatalf("lookup frag in snapshot: %s", st)
+	}
+	if snapFile == file {
+		t.Fatalf("snapshot aliased the live inode %d", file)
+	}
+
+	// what the snapshot actually captured, whatever background compaction may
+	// have done to the live file in the meantime
+	var before []Slice
+	if st := m.Read(ctx, snapFile, 0, &before); st != 0 {
+		t.Fatalf("read snapshot: %s", st)
+	}
+	var liveSlices []Slice
+	if st := m.Read(ctx, file, 0, &liveSlices); st != 0 {
+		t.Fatalf("read live: %s", st)
+	}
+	live := make(map[uint64]bool)
+	for _, s := range liveSlices {
+		live[s.Id] = true
+	}
+	shared := make(map[uint64]bool)
+	for _, s := range before {
+		if s.Id > 0 && live[s.Id] {
+			shared[s.Id] = true
+		}
+	}
+	if len(shared) == 0 {
+		t.Fatalf("snapshot and live file share no slice, nothing to test")
+	}
+	// make sure the live chunk has something to merge even if it was compacted
+	// already, so the shared slices really are released by the compaction
+	write(5000)
+	write(6000)
+
+	c.compactChunk(file, 0, false, true, 0)
+
+	var after []Slice
+	if st := m.Read(ctx, file, 0, &after); st != 0 {
+		t.Fatalf("read live after compact: %s", st)
+	}
+	if len(after) != 1 {
+		t.Fatalf("compaction did not merge the live chunk: %d slices", len(after))
+	}
+
+	// the snapshot still lists exactly what it captured
+	var snap []Slice
+	if st := m.Read(ctx, snapFile, 0, &snap); st != 0 {
+		t.Fatalf("read snapshot after compact: %s", st)
+	}
+	if len(snap) != len(before) {
+		t.Fatalf("snapshot slice list changed: %d slices, want %d", len(snap), len(before))
+	}
+	for i := range snap {
+		if snap[i].Id != before[i].Id || snap[i].Len != before[i].Len {
+			t.Fatalf("snapshot slice %d changed: %+v, want %+v", i, snap[i], before[i])
+		}
+	}
+
+	// and none of the shared slices was handed to the object store for deletion
+	l.Lock()
+	defer l.Unlock()
+	for id := range shared {
+		if deleted[id] {
+			t.Fatalf("slice %d is still referenced by the snapshot but compaction freed its data", id)
+		}
 	}
 }
 

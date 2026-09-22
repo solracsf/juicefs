@@ -471,8 +471,10 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 	recordInode := func(inode uint64) {
 		if Ino(inode) < TrashInode {
 			c.NextInode = max(c.NextInode, int64(inode)+1)
-		} else {
+		} else if Ino(inode).IsTrash() {
 			c.NextTrash = max(c.NextTrash, int64(Ino(inode)-TrashInode))
+		} else {
+			c.NextSnapshot = max(c.NextSnapshot, int64(Ino(inode)-SnapshotInode))
 		}
 	}
 	switch seg.typ {
@@ -489,6 +491,8 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 				c.NextSession = max(c.NextSession, counter.Value)
 			case "nextTrash":
 				c.NextTrash = max(c.NextTrash, counter.Value)
+			case "nextSnapshot":
+				c.NextSnapshot = max(c.NextSnapshot, counter.Value)
 			}
 		}
 		return true
@@ -496,7 +500,7 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 		var attr Attr
 		for _, node := range seg.val.(*pb.Batch).Nodes {
 			recordInode(node.Inode)
-			if Ino(node.Inode) != RootInode && Ino(node.Inode) != TrashInode {
+			if Ino(node.Inode) != RootInode && Ino(node.Inode) != TrashInode && Ino(node.Inode) != SnapshotInode {
 				attr.Unmarshal(node.Data)
 				c.UsedSpace += align4K(attr.Length)
 				c.UsedInodes++
@@ -532,7 +536,7 @@ func (c *DumpedCounters) toBatch(counters []*pb.Counter) *pb.Batch {
 	others := counters[:0]
 	for _, counter := range counters {
 		switch counter.Key {
-		case usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash":
+		case usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash", "nextSnapshot":
 		default:
 			others = append(others, counter)
 		}
@@ -544,6 +548,7 @@ func (c *DumpedCounters) toBatch(counters []*pb.Counter) *pb.Batch {
 		&pb.Counter{Key: "nextChunk", Value: c.NextChunk},
 		&pb.Counter{Key: "nextSession", Value: c.NextSession},
 		&pb.Counter{Key: "nextTrash", Value: c.NextTrash},
+		&pb.Counter{Key: "nextSnapshot", Value: c.NextSnapshot},
 	)}
 }
 

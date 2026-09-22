@@ -897,6 +897,131 @@ func testSecretAndTrash(t *testing.T, addr, addr2 string) {
 	m2.Shutdown()
 }
 
+func newSnapshotDumpMeta(t *testing.T, engine string, db int) Meta {
+	uri := engine + "://" + path.Join(t.TempDir(), "meta")
+	if engine == "redis" {
+		uri = fmt.Sprintf("redis://127.0.0.1:6379/%d", db)
+	}
+	m := NewClient(uri, nil)
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset %s: %s", uri, err)
+	}
+	t.Cleanup(func() {
+		_ = m.Reset()
+		_ = m.Shutdown()
+	})
+	return m
+}
+
+func TestLoadDumpSnapshots(t *testing.T) {
+	for _, engine := range []string{"redis", "sqlite3", "badger"} {
+		for _, format := range []string{"json-fast", "json", "v2"} {
+			t.Run(engine+"/"+format, func(t *testing.T) {
+				ctx := Background()
+				src := newSnapshotDumpMeta(t, engine, 7)
+				if err := src.Init(testFormat(), false); err != nil {
+					t.Fatalf("init: %s", err)
+				}
+				if err := src.NewSession(false); err != nil {
+					t.Fatalf("new session: %s", err)
+				}
+				var dir, sub, file Ino
+				if st := src.Mkdir(ctx, RootInode, "d", 0777, 022, 0, &dir, &Attr{}); st != 0 {
+					t.Fatalf("mkdir d: %s", st)
+				}
+				if st := src.Mkdir(ctx, dir, "sub", 0777, 022, 0, &sub, &Attr{}); st != 0 {
+					t.Fatalf("mkdir sub: %s", st)
+				}
+				if st := src.Create(ctx, sub, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+					t.Fatalf("create f: %s", st)
+				}
+				if st := src.Write(ctx, file, 0, 0, Slice{Id: 300001, Size: 100, Len: 100}, time.Now()); st != 0 {
+					t.Fatalf("write f: %s", st)
+				}
+				snap, st := src.CreateSnapshot(ctx, dir, "s1", nil, nil)
+				if st != 0 {
+					t.Fatalf("create snapshot: %s", st)
+				}
+				src.getBase().doFlushStats()
+
+				var buf bytes.Buffer
+				var err error
+				if format == "v2" {
+					err = src.DumpMetaV2(ctx, &buf, &DumpOption{Threads: 2, KeepSecret: true})
+				} else {
+					err = src.DumpMeta(&buf, RootInode, 2, true, format == "json-fast", false)
+				}
+				if err != nil {
+					t.Fatalf("dump: %s", err)
+				}
+
+				dst := newSnapshotDumpMeta(t, engine, 8)
+				if format == "v2" {
+					err = dst.LoadMetaV2(ctx, &buf, &LoadOption{Threads: 2})
+				} else {
+					err = dst.LoadMeta(&buf)
+				}
+				if err != nil {
+					t.Fatalf("load: %s", err)
+				}
+				if _, err = dst.Load(true); err != nil {
+					t.Fatalf("load format: %s", err)
+				}
+				if err = dst.NewSession(false); err != nil {
+					t.Fatalf("new session: %s", err)
+				}
+
+				snaps, st := dst.ListSnapshots(ctx)
+				if st != 0 || len(snaps) != 1 || snaps[0].Name != "s1" || snaps[0].Inode != snap {
+					t.Fatalf("snapshots after load: %+v %s, want s1 at %d", snaps, st, snap)
+				}
+				for _, ino := range []Ino{SnapshotInode, snap} {
+					var want, got Attr
+					if st := src.GetAttr(ctx, ino, &want); st != 0 {
+						t.Fatalf("getattr %d on source: %s", ino, st)
+					}
+					if st := dst.GetAttr(ctx, ino, &got); st != 0 {
+						t.Fatalf("getattr %d after load: %s", ino, st)
+					}
+					if got.Nlink != want.Nlink || got.Flags != want.Flags || got.Parent != want.Parent {
+						t.Fatalf("inode %d after load: nlink %d flags %d parent %d, want %d %d %d",
+							ino, got.Nlink, got.Flags, got.Parent, want.Nlink, want.Flags, want.Parent)
+					}
+				}
+				var snapSub, snapFile Ino
+				var attr Attr
+				if st := dst.Lookup(ctx, snap, "sub", &snapSub, &attr, false); st != 0 {
+					t.Fatalf("lookup sub in snapshot: %s", st)
+				}
+				if st := dst.Lookup(ctx, snapSub, "f", &snapFile, &attr, false); st != 0 {
+					t.Fatalf("lookup f in snapshot: %s", st)
+				}
+				if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable || attr.Length != 100 {
+					t.Fatalf("snapshot file after load: flags %d length %d", attr.Flags, attr.Length)
+				}
+
+				for _, name := range []string{usedSpace, totalInodes} {
+					want, _ := src.getBase().en.getCounter(name)
+					got, _ := dst.getBase().en.getCounter(name)
+					if got != want {
+						t.Fatalf("%s after load: %d, want %d", name, got, want)
+					}
+				}
+				if next, _ := dst.getBase().en.getCounter("nextTrash"); next >= int64(SnapshotInode-TrashInode) {
+					t.Fatalf("nextTrash %d ran into the snapshot range", next)
+				}
+				snap2, st := dst.CreateSnapshot(ctx, dir, "s2", nil, nil)
+				if st != 0 {
+					t.Fatalf("snapshot after load: %s", st)
+				}
+				if snap2 <= snap || !snap2.IsSnapshot() {
+					t.Fatalf("snapshot after load got inode %d, want one above %d", snap2, snap)
+				}
+			})
+		}
+	}
+}
+
 /*
 func BenchmarkLoadDumpV2(b *testing.B) {
 	logrus.SetLevel(logrus.DebugLevel)

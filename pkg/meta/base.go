@@ -2912,6 +2912,15 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		}
 	}
 
+	// a snapshot is frozen: merging its slices would rewrite what it captured,
+	// and write to object storage on behalf of read-only data. Checked here, after
+	// the cheap structural tests above, so it costs a read only when compaction
+	// would otherwise go ahead
+	var cattr Attr
+	if eno := m.en.doGetAttr(Background(), inode, &cattr); eno == 0 && cattr.Flags&FlagSnapshot != 0 {
+		return
+	}
+
 	var id uint64
 	if st = m.NewSlice(Background(), &id); st != 0 {
 		return
