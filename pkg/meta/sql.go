@@ -5006,6 +5006,15 @@ func (m *dbMeta) makeSnap(ses *xorm.Session, bar *utils.Bar) error {
 }
 
 func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) (err error) {
+	setting, err := m.dumpedFormat()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			err = m.checkDumpedFloor(setting.MinClientVersion)
+		}
+	}()
 	defer func() {
 		if p := recover(); p != nil {
 			debug.PrintStack()
@@ -5188,7 +5197,7 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 		}
 
 		dm := DumpedMeta{
-			Setting:     *m.getFormat(),
+			Setting:     setting,
 			Counters:    counters,
 			Sustained:   sessions,
 			DelFiles:    dels,

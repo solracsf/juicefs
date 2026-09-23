@@ -320,6 +320,23 @@ func newBakSegment(val proto.Message) *BakSegment {
 	return s
 }
 
+// checkLoadSegment is called on each segment a load writes as it reads it,
+// streamed telling whether one came before: a format this client refuses must
+// stop the load before its first write.
+func checkLoadSegment(s *BakSegment, streamed bool) error {
+	if s.typ != segTypeFormat {
+		return nil
+	}
+	if streamed {
+		return fmt.Errorf("backup has its format after other segments")
+	}
+	var format Format
+	if err := json.Unmarshal(s.val.(*pb.Format).Data, &format); err != nil {
+		return fmt.Errorf("parse format: %s", err)
+	}
+	return format.CheckVersion()
+}
+
 func (s *BakSegment) num() uint64 {
 	switch s.typ {
 	case segTypeFormat:
@@ -417,6 +434,8 @@ type DumpOption struct {
 	KeepSecret bool
 	Threads    int
 	Progress   func(name string, cnt int)
+
+	minClientVersion string // recorded in the dumped format
 }
 
 func (opt *DumpOption) check() *DumpOption {
@@ -430,14 +449,17 @@ func (opt *DumpOption) check() *DumpOption {
 }
 
 func (m *baseMeta) dumpFormat(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) error {
-	f := m.GetFormat()
+	f, err := m.dumpedFormat()
+	if err != nil {
+		return err
+	}
+	opt.minClientVersion = f.MinClientVersion
 	if !opt.KeepSecret {
 		f.RemoveSecret()
 	}
 	data, err := json.MarshalIndent(f, "", "")
 	if err != nil {
-		logger.Errorf("failed to marshal format %s: %v", f.Name, err)
-		return nil
+		return fmt.Errorf("marshal format %s: %v", f.Name, err)
 	}
 	return dumpResult(ctx, ch, &dumpedResult{msg: &pb.Format{Data: data}})
 }

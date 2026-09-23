@@ -462,17 +462,25 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 	parents = make(map[Ino][]Ino)
 	refs = make(map[chunkKey]int64)
 	var name json.Token
+	var hasSetting bool
 	for dec.More() {
 		name, err = dec.Token()
 		if err != nil {
 			err = fmt.Errorf("parse name: %s", err)
 			return
 		}
+		// entries are written as they are decoded: only a dump whose settings
+		// this client accepts may reach the first write
+		if !hasSetting && (name == "FSTree" || name == "Trash" || name == "Snapshots") {
+			err = fmt.Errorf("load %v: no 'Setting' before the entries", name)
+			return
+		}
 		switch name {
 		case "Setting":
 			if err = dec.Decode(&dm.Setting); err == nil {
-				_, err = json.MarshalIndent(dm.Setting, "", "")
+				err = dm.Setting.CheckVersion()
 			}
+			hasSetting = true
 		case "Counters":
 			if err = dec.Decode(&dm.Counters); err == nil {
 				bar.SetTotal(dm.Counters.UsedInodes) // TODO

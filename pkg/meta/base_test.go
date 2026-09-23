@@ -4816,6 +4816,32 @@ func testSnapshotRoot(t *testing.T, m Meta) {
 		t.Fatalf("looking up %s before any snapshot should be ENOENT, got %s", SnapshotName, st)
 	}
 
+	// a directory of that name written before snapshots existed stays reachable,
+	// and blocks the hidden root until it is moved out of the way
+	old, err := base.nextInode()
+	if err != nil {
+		t.Fatalf("allocate inode: %s", err)
+	}
+	if st := base.en.doMknod(ctx, RootInode, SnapshotName, TypeDirectory, 0755, 0, "", &old,
+		&Attr{Typ: TypeDirectory, Mode: 0755, Nlink: 2, Full: true}); st != 0 {
+		t.Fatalf("create a pre-existing %s: %s", SnapshotName, st)
+	}
+	if st := m.Lookup(ctx, RootInode, SnapshotName, &inode, &attr, false); st != 0 || inode != old {
+		t.Fatalf("pre-existing %s should resolve to %d, got %d %s", SnapshotName, old, inode, st)
+	}
+	if st := base.ensureSnapshotRoot(ctx); st != syscall.EEXIST {
+		t.Fatalf("the hidden root must not shadow a real %s, got %s", SnapshotName, st)
+	}
+	if st := m.Rename(ctx, RootInode, SnapshotName, RootInode, "old-snapshots", 0, &inode, &attr); st != 0 {
+		t.Fatalf("moving a pre-existing %s away: %s", SnapshotName, st)
+	}
+	if st := m.Rmdir(ctx, RootInode, "old-snapshots"); st != 0 {
+		t.Fatalf("rmdir old-snapshots: %s", st)
+	}
+	if st := m.Mkdir(ctx, RootInode, SnapshotName, 0777, 022, 0, &inode, &Attr{}); st != syscall.EPERM {
+		t.Fatalf("mkdir %s should stay EPERM, got %s", SnapshotName, st)
+	}
+
 	if st := base.ensureSnapshotRoot(ctx); st != 0 {
 		t.Fatalf("ensure snapshot root: %s", st)
 	}
@@ -4947,6 +4973,10 @@ func testSnapshot(t *testing.T, m Meta) {
 	}
 	if count != 3 || total != 3 {
 		t.Fatalf("snapshot copied %d of %d entries, want 3 of 3", count, total)
+	}
+	// clients too old for snapshots can no longer mount the volume
+	if f, err := m.Load(false); err != nil || f.MinClientVersion != MinSnapshotVersion {
+		t.Fatalf("min client version after the first snapshot: %+v %v, want %s", f, err, MinSnapshotVersion)
 	}
 
 	// reachable by path, and every copied inode is frozen

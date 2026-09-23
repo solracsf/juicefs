@@ -1022,6 +1022,116 @@ func TestLoadDumpSnapshots(t *testing.T) {
 	}
 }
 
+// A dump this client may not load is refused before its first write.
+func TestLoadRefusesNewerDump(t *testing.T) {
+	for _, engine := range []string{"redis", "sqlite3", "badger"} {
+		for _, format := range []string{"json", "v2"} {
+			t.Run(engine+"/"+format, func(t *testing.T) {
+				src := newSnapshotDumpMeta(t, engine, 7)
+				f := testFormat()
+				f.MinClientVersion = "99.0.0"
+				if err := src.Init(f, false); err != nil {
+					t.Fatalf("init: %s", err)
+				}
+				var buf bytes.Buffer
+				var err error
+				if format == "v2" {
+					err = src.DumpMetaV2(Background(), &buf, &DumpOption{Threads: 2, KeepSecret: true})
+				} else {
+					err = src.DumpMeta(&buf, RootInode, 2, true, false, false)
+				}
+				if err != nil {
+					t.Fatalf("dump: %s", err)
+				}
+
+				dst := newSnapshotDumpMeta(t, engine, 8)
+				if format == "v2" {
+					err = dst.LoadMetaV2(Background(), &buf, &LoadOption{Threads: 2})
+				} else {
+					err = dst.LoadMeta(&buf)
+				}
+				if err == nil || !strings.Contains(err.Error(), "please upgrade the client") {
+					t.Fatalf("loading a dump for newer clients: %v, want a refusal", err)
+				}
+				if st := dst.getBase().en.doGetAttr(Background(), RootInode, &Attr{}); st == 0 {
+					t.Fatalf("a refused load wrote the root")
+				}
+			})
+		}
+	}
+}
+
+type raisingWriter struct {
+	io.Writer
+	raise func()
+}
+
+func (w *raisingWriter) Write(p []byte) (int, error) {
+	if w.raise != nil {
+		w.raise()
+		w.raise = nil
+	}
+	return w.Writer.Write(p)
+}
+
+// A dump records the minimum client version the volume has, not the one its
+// client loaded, and fails when the first snapshot raises it meanwhile.
+func TestDumpRecordsSnapshotFloor(t *testing.T) {
+	for _, engine := range []string{"redis", "sqlite3", "badger"} {
+		for _, format := range []string{"json", "v2"} {
+			t.Run(engine+"/"+format, func(t *testing.T) {
+				m := newSnapshotDumpMeta(t, engine, 7)
+				if err := m.Init(testFormat(), false); err != nil {
+					t.Fatalf("init: %s", err)
+				}
+				dump := func(raise func()) (*bytes.Buffer, error) {
+					var buf bytes.Buffer
+					w := &raisingWriter{&buf, raise}
+					if format == "v2" {
+						return &buf, m.DumpMetaV2(Background(), w, &DumpOption{Threads: 2, KeepSecret: true})
+					}
+					return &buf, m.DumpMeta(w, RootInode, 2, true, false, false)
+				}
+				// another client takes the first snapshot: the stored format is
+				// raised, and this client keeps the format it loaded before
+				raise := func() {
+					loaded := m.getBase().getFormat()
+					decrypted := *loaded
+					decrypted.SecretKey = "decrypted"
+					m.getBase().setFormat(&decrypted)
+					if err := m.getBase().raiseMinClientVersion(); err != nil {
+						t.Errorf("raise min client version: %s", err)
+					}
+					// the raising client keeps its format, secrets as decrypted
+					if f := m.getBase().getFormat(); f.SecretKey != "decrypted" || f.MinClientVersion != MinSnapshotVersion {
+						t.Errorf("format after the raise: secret %q, min client version %q", f.SecretKey, f.MinClientVersion)
+					}
+					m.getBase().setFormat(loaded)
+				}
+				if _, err := dump(raise); err == nil || !strings.Contains(err.Error(), "dump it again") {
+					t.Fatalf("dump while the floor was raised: %v, want a failure", err)
+				}
+				buf, err := dump(nil)
+				if err != nil {
+					t.Fatalf("dump: %s", err)
+				}
+				dst := newSnapshotDumpMeta(t, engine, 8)
+				if format == "v2" {
+					err = dst.LoadMetaV2(Background(), buf, &LoadOption{Threads: 2})
+				} else {
+					err = dst.LoadMeta(buf)
+				}
+				if err != nil {
+					t.Fatalf("load: %s", err)
+				}
+				if f, err := dst.Load(false); err != nil || f.MinClientVersion != MinSnapshotVersion {
+					t.Fatalf("dumped min client version: %+v %v, want %s", f, err, MinSnapshotVersion)
+				}
+			})
+		}
+	}
+}
+
 /*
 func BenchmarkLoadDumpV2(b *testing.B) {
 	logrus.SetLevel(logrus.DebugLevel)

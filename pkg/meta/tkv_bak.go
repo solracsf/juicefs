@@ -772,6 +772,7 @@ func (m *kvMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {
 
 	loaded := DumpedCounters{NextInode: 2, NextChunk: 1}
 	var counters []*pb.Counter
+	var streamed bool
 	bak := &BakFormat{}
 
 	sendTask := func(t *task, name string, num int) bool {
@@ -813,6 +814,12 @@ func (m *kvMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {
 		if loaded.updateFromSegment(seg, &counters) {
 			continue
 		}
+		if err = checkLoadSegment(seg, streamed); err != nil {
+			ctx.Cancel()
+			wg.Wait()
+			return err
+		}
+		streamed = true
 
 		if !sendTask(&task{int(seg.typ), seg.val}, seg.Name(), int(seg.num())) {
 			wg.Wait()

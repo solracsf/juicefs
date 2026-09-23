@@ -1306,13 +1306,14 @@ func (m *baseMeta) Lookup(ctx Context, parent Ino, name string, inode *Ino, attr
 		return 0
 	}
 	if parent == RootInode && name == SnapshotName {
-		// the root is created with the first snapshot, so ENOENT here simply means
-		// this volume has none yet
-		if st := m.GetAttr(ctx, SnapshotInode, attr); st != 0 {
+		// the root is created with the first snapshot; until then the name resolves
+		// normally, so a directory written before snapshots existed stays reachable
+		if st := m.GetAttr(ctx, SnapshotInode, attr); st == 0 {
+			*inode = SnapshotInode
+			return 0
+		} else if st != syscall.ENOENT {
 			return st
 		}
-		*inode = SnapshotInode
-		return 0
 	}
 	st := m.en.doLookup(ctx, parent, name, inode, attr)
 	if st == syscall.ENOENT && m.conf.CaseInsensi {
@@ -1822,7 +1823,7 @@ func (m *baseMeta) ReadLink(ctx Context, inode Ino, path *[]byte) syscall.Errno 
 }
 
 func (m *baseMeta) Unlink(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno {
-	if isReservedEntry(parent, name) || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
+	if m.hidesEntry(ctx, parent, name) || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1853,7 +1854,7 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 	if name == ".." {
 		return syscall.ENOTEMPTY
 	}
-	if isReservedEntry(parent, name) || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
+	if m.hidesEntry(ctx, parent, name) || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1925,7 +1926,7 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 }
 
 func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
-	if isReservedEntry(parentSrc, nameSrc) || isReservedEntry(parentDst, nameDst) || parentSrc.IsSnapshot() || parentDst.IsSnapshot() {
+	if m.hidesEntry(ctx, parentSrc, nameSrc) || isReservedEntry(parentDst, nameDst) || parentSrc.IsSnapshot() || parentDst.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if parentDst.IsTrash() || parentSrc.IsTrash() && ctx.Uid() != 0 {
@@ -3112,6 +3113,13 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 	if st != syscall.ENOENT {
 		return st // already there, or a real error
 	}
+	var ino Ino
+	if st = m.en.doLookup(ctx, RootInode, SnapshotName, &ino, nil); st == 0 {
+		logger.Errorf("/%s already exists as inode %d; rename it before taking snapshots", SnapshotName, ino)
+		return syscall.EEXIST
+	} else if st != syscall.ENOENT {
+		return st
+	}
 	now := time.Now()
 	attr := Attr{
 		Typ:    TypeDirectory,
@@ -3128,6 +3136,16 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 	// nlink from the edges instead of resetting it to 2. Like the trash root, this
 	// one is not counted in the volume usage.
 	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
+}
+
+// hidesEntry reports whether name under parent is a hidden root that must not be
+// removed or renamed. A real /.snapshots from before snapshots existed is not
+// hidden until the snapshot root is created, so it can still be moved away.
+func (m *baseMeta) hidesEntry(ctx Context, parent Ino, name string) bool {
+	if parent != RootInode || name != TrashName && name != SnapshotName {
+		return false
+	}
+	return name == TrashName || m.en.doGetAttr(ctx, SnapshotInode, nil) != syscall.ENOENT
 }
 
 // SnapshotInfo describes one snapshot under the hidden .snapshots root.
@@ -3160,6 +3178,95 @@ func (m *baseMeta) checkSnapshotSessions(ctx Context) syscall.Errno {
 	return 0
 }
 
+// storedFormat reads the format as the metadata engine holds it, which may be
+// newer than the copy this client loaded.
+func (m *baseMeta) storedFormat() (*Format, error) {
+	body, err := m.en.doLoad()
+	if err != nil {
+		return nil, err
+	}
+	var format Format
+	if err = json.Unmarshal(body, &format); err != nil {
+		return nil, err
+	}
+	return &format, nil
+}
+
+// belowVersion tells whether a minimum client version is lower than floor,
+// an empty one being the lowest.
+func belowVersion(v, floor string) (bool, error) {
+	if floor == "" {
+		return false, nil
+	}
+	if v == "" {
+		return true, nil
+	}
+	r, err := version.CompareVersions(version.Parse(v), version.Parse(floor))
+	return r < 0, err
+}
+
+// raiseMinClientVersion stops clients that predate snapshots from mounting,
+// since they would neither honor the freeze nor spare snapshot roots in gc. It
+// rewrites the stored format, never lowering an existing floor, and then only
+// the floor of the in-memory copy, which holds its secrets decrypted.
+func (m *baseMeta) raiseMinClientVersion() error {
+	format, err := m.storedFormat()
+	if err != nil {
+		return err
+	}
+	if below, err := belowVersion(format.MinClientVersion, MinSnapshotVersion); err != nil || !below {
+		return err
+	}
+	old, loaded := format.MinClientVersion, *m.getFormat()
+	format.MinClientVersion = MinSnapshotVersion
+	if err = m.en.doInit(format, false); err != nil {
+		return err
+	}
+	loaded.MinClientVersion = MinSnapshotVersion
+	m.setFormat(&loaded)
+	if old == "" {
+		old = "none"
+	}
+	logger.Warnf("Raised the minimum client version of volume %s from %s to %s for snapshots: "+
+		"older clients can no longer mount it, even if this snapshot fails", format.Name, old, MinSnapshotVersion)
+	return nil
+}
+
+// dumpedFormat is the format a dump records: the loaded one, with the stored
+// minimum client version when a snapshot has raised it since the load.
+func (m *baseMeta) dumpedFormat() (Format, error) {
+	format := *m.getFormat()
+	stored, err := m.storedFormat()
+	if err != nil {
+		return format, err
+	}
+	if below, err := belowVersion(format.MinClientVersion, stored.MinClientVersion); err != nil {
+		return format, err
+	} else if below {
+		format.MinClientVersion = stored.MinClientVersion
+	}
+	return format, nil
+}
+
+// checkDumpedFloor fails a dump when the volume raised its minimum client
+// version while the dump ran, past the one the dump recorded: the first
+// snapshot raises it before writing anything, so such a dump may hold a
+// snapshot without the version that keeps older clients from loading it.
+func (m *baseMeta) checkDumpedFloor(dumped string) error {
+	stored, err := m.storedFormat()
+	if err != nil {
+		return err
+	}
+	if below, err := belowVersion(dumped, stored.MinClientVersion); err != nil || !below {
+		return err
+	}
+	if dumped == "" {
+		dumped = "none"
+	}
+	return fmt.Errorf("the minimum client version of the volume was raised from %s to %s while it was dumped, "+
+		"so the dump may hold snapshots it does not guard; dump it again", dumped, stored.MinClientVersion)
+}
+
 // CreateSnapshot freezes a copy of the tree at src under .snapshots/name. The
 // copy shares its data with the original: only metadata is written.
 func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, total *uint64) (Ino, syscall.Errno) {
@@ -3189,6 +3296,12 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 	}
 	if st := m.Access(ctx, src, MODE_MASK_R|MODE_MASK_X, &srcAttr); st != 0 {
 		return 0, st
+	}
+	// raise the floor first so no new old client can mount, then refuse while
+	// one that is already mounted is still running
+	if err := m.raiseMinClientVersion(); err != nil {
+		logger.Errorf("raise min client version for snapshots: %s", err)
+		return 0, syscall.EIO
 	}
 	if st := m.checkSnapshotSessions(ctx); st != 0 {
 		return 0, st
@@ -4294,7 +4407,10 @@ func (m *baseMeta) DumpMetaV2(ctx Context, w io.Writer, opt *DumpOption) error {
 	}
 
 	wg.Wait()
-	return bak.writeFooter(w)
+	if err := bak.writeFooter(w); err != nil {
+		return err
+	}
+	return m.checkDumpedFloor(opt.minClientVersion)
 }
 
 func (m *baseMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {
@@ -4341,6 +4457,7 @@ func (m *baseMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {
 
 	loaded := DumpedCounters{NextInode: 2, NextChunk: 1}
 	var counters []*pb.Counter
+	var streamed bool
 	bak := &BakFormat{}
 
 	sendTask := func(t *task, name string, num int) bool {
@@ -4383,6 +4500,12 @@ func (m *baseMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {
 		if loaded.updateFromSegment(seg, &counters) {
 			continue
 		}
+		if err = checkLoadSegment(seg, streamed); err != nil {
+			ctx.Cancel()
+			wg.Wait()
+			return err
+		}
+		streamed = true
 
 		if !sendTask(&task{int(seg.typ), seg.val}, seg.Name(), int(seg.num())) {
 			wg.Wait()

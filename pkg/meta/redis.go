@@ -4967,6 +4967,15 @@ func (m *redisMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, dept
 }
 
 func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) (err error) {
+	setting, err := m.dumpedFormat()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			err = m.checkDumpedFloor(setting.MinClientVersion)
+		}
+	}()
 	defer func() {
 		if p := recover(); p != nil {
 			debug.PrintStack()
@@ -5043,7 +5052,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 	groupQuotas := m.loadQuotasForDump(ctx, m.groupQuotaKey())
 
 	dm := &DumpedMeta{
-		Setting: *m.getFormat(),
+		Setting: setting,
 		Counters: &DumpedCounters{
 			UsedSpace:     cs[0],
 			UsedInodes:    cs[1],
