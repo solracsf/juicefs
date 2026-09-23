@@ -5232,6 +5232,26 @@ func testSnapshotConsistency(t *testing.T, m Meta) {
 		"move": func(dir, file, sub Ino) syscall.Errno {
 			return m.Rename(ctx, dir, "f", sub, "f", 0, &ino, &attr)
 		},
+		// changes undone before the comparison: the tree looks the same again, but
+		// it went through a state the copy may have mixed with the one before
+		"move there and back": func(dir, file, sub Ino) syscall.Errno {
+			if st := m.Rename(ctx, dir, "f", sub, "f", 0, &ino, &attr); st != 0 {
+				return st
+			}
+			return m.Rename(ctx, sub, "f", dir, "f", 0, &ino, &attr)
+		},
+		"setxattr there and back": func(dir, file, sub Ino) syscall.Errno {
+			if st := m.SetXattr(ctx, file, "user.k", []byte("w"), 0); st != 0 {
+				return st
+			}
+			return m.SetXattr(ctx, file, "user.k", []byte("v"), 0)
+		},
+		"removexattr there and back": func(dir, file, sub Ino) syscall.Errno {
+			if st := m.RemoveXattr(ctx, file, "user.k"); st != 0 {
+				return st
+			}
+			return m.SetXattr(ctx, file, "user.k", []byte("v"), 0)
+		},
 	} {
 		dir, file, sub, root := setup()
 		if st := change(dir, file, sub); st != 0 {
@@ -5258,6 +5278,31 @@ func testSnapshotConsistency(t *testing.T, m Meta) {
 	base.conf.AtimeMode = mode
 	if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
 		t.Fatalf("reading the source made its snapshot differ: %v %s", same, st)
+	}
+
+	// The known limit of using ctime as the change signal: a change that restores
+	// every compared value, ctime included, cannot be told apart from no change.
+	// Here the attribute value is put back first, which ctime still betrays, then
+	// the ctime itself, as a client with a clock set back to that very nanosecond
+	// would; the comparison then accepts the tree, as documented.
+	dir, file, _, root = setup()
+	var orig Attr
+	if st := base.en.doGetAttr(ctx, file, &orig); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	for _, v := range []string{"w", "v"} {
+		if st := m.SetXattr(ctx, file, "user.k", []byte(v), 0); st != 0 {
+			t.Fatalf("setxattr %s: %s", v, st)
+		}
+	}
+	if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || same {
+		t.Fatalf("a value put back went unnoticed though its ctime moved: %v %s", same, st)
+	}
+	if st := base.en.doRepair(ctx, file, &orig, true); st != 0 {
+		t.Fatalf("restore ctime: %s", st)
+	}
+	if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
+		t.Fatalf("with every value and ctime restored the comparison should accept the tree, its documented limit: %v %s", same, st)
 	}
 }
 

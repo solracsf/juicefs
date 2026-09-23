@@ -3510,7 +3510,8 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
-		if tx.get(m.inodeKey(inode)) == nil {
+		a := tx.get(m.inodeKey(inode))
+		if a == nil {
 			return syscall.ENOENT
 		}
 		v := tx.get(key)
@@ -3527,7 +3528,8 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 		if v == nil || !bytes.Equal(v, value) {
 			tx.set(key, value)
 		}
-		m.genLog(tx, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
+		now := m.touchCtime(tx, inode, a)
+		m.genLog(tx, now, "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 		return nil
 	}, inode))
 }
@@ -3535,7 +3537,8 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
-		if tx.get(m.inodeKey(inode)) == nil {
+		a := tx.get(m.inodeKey(inode))
+		if a == nil {
 			return syscall.ENOENT
 		}
 		value := tx.get(key)
@@ -3543,9 +3546,22 @@ func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 			return ENOATTR
 		}
 		tx.delete(key)
-		m.genLog(tx, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
+		now := m.touchCtime(tx, inode, a)
+		m.genLog(tx, now, "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 		return nil
 	}, inode))
+}
+
+// touchCtime sets the ctime of inode, whose attributes are a, to now, as a
+// change of its extended attributes does.
+func (m *kvMeta) touchCtime(tx *kvTxn, inode Ino, a []byte) time.Time {
+	var attr Attr
+	m.parseAttr(a, &attr)
+	now := time.Now()
+	attr.Ctime = now.Unix()
+	attr.Ctimensec = uint32(now.Nanosecond())
+	tx.set(m.inodeKey(inode), m.marshal(&attr))
+	return now
 }
 
 func (m *kvMeta) getQuotaKey(qtype uint32, key uint64) ([]byte, error) {

@@ -4380,12 +4380,11 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 	inodeKey := m.inodeKey(inode)
 	xattrKey := m.xattrKey(inode)
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		exists, err := tx.Exists(ctx, inodeKey).Result()
-		if err != nil {
-			return err
-		}
-		if exists == 0 {
+		a, err := tx.Get(ctx, inodeKey).Bytes()
+		if err == redis.Nil {
 			return syscall.ENOENT
+		} else if err != nil {
+			return err
 		}
 		switch flags {
 		case XattrCreate:
@@ -4405,9 +4404,15 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return ENOATTR
 			}
 		}
+		var attr Attr
+		m.parseAttr(a, &attr)
+		now := time.Now()
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.HSet(ctx, xattrKey, name, value)
-			m.genLog(ctx, pipe, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
+			pipe.Set(ctx, inodeKey, m.marshal(&attr), 0)
+			m.genLog(ctx, pipe, now, "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 			return nil
 		})
 		return err
@@ -4417,34 +4422,31 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	inodeKey := m.inodeKey(inode)
 	xattrKey := m.xattrKey(inode)
-	var n int64
-	err := m.txn(ctx, func(tx *redis.Tx) error {
-		exists, err := tx.Exists(ctx, inodeKey).Result()
-		if err != nil {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		a, err := tx.Get(ctx, inodeKey).Bytes()
+		if err == redis.Nil {
+			return syscall.ENOENT
+		} else if err != nil {
 			return err
 		}
-		if exists == 0 {
-			return syscall.ENOENT
+		if ok, err := tx.HExists(ctx, xattrKey, name).Result(); err != nil {
+			return err
+		} else if !ok {
+			return ENOATTR
 		}
-		cmd, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		var attr Attr
+		m.parseAttr(a, &attr)
+		now := time.Now()
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.HDel(ctx, xattrKey, name)
-			m.genLog(ctx, pipe, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
+			pipe.Set(ctx, inodeKey, m.marshal(&attr), 0)
+			m.genLog(ctx, pipe, now, "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 			return nil
 		})
-		if err == nil && len(cmd) > 0 {
-			if delCmd, ok := cmd[0].(*redis.IntCmd); ok {
-				n, _ = delCmd.Result()
-			}
-		}
 		return err
-	}, inodeKey, xattrKey)
-	if err != nil {
-		return errno(err)
-	} else if n == 0 {
-		return ENOATTR
-	} else {
-		return 0
-	}
+	}, inodeKey, xattrKey))
 }
 
 type quotaKeys struct {

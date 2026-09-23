@@ -4402,7 +4402,8 @@ func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 
 func (m *dbMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
 	return errno(m.txn(func(s *xorm.Session) error {
-		if err := m.getNodesForUpdate(s, &node{Inode: inode}); err != nil {
+		var n = node{Inode: inode}
+		if err := m.getNodesForUpdate(s, &n); err != nil {
 			return err
 		}
 		var k = &xattr{Inode: inode, Name: name}
@@ -4431,16 +4432,23 @@ func (m *dbMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 				_, err = s.Cols("value").Update(&x, k)
 			}
 		}
-		if err == nil {
-			m.genLog(ctx, s, time.Now().UnixNano(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
+		if err != nil {
+			return err
 		}
-		return err
+		now := time.Now().UnixNano()
+		n.setCtime(now)
+		if _, err = s.Cols("ctime", "ctimensec").Update(&n, &node{Inode: inode}); err != nil {
+			return err
+		}
+		m.genLog(ctx, s, now, "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
+		return nil
 	}))
 }
 
 func (m *dbMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	return errno(m.txn(func(s *xorm.Session) error {
-		if err := m.getNodesForUpdate(s, &node{Inode: inode}); err != nil {
+		var nd = node{Inode: inode}
+		if err := m.getNodesForUpdate(s, &nd); err != nil {
 			return err
 		}
 		n, err := s.Delete(&xattr{Inode: inode, Name: name})
@@ -4448,10 +4456,14 @@ func (m *dbMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 			return err
 		} else if n == 0 {
 			return ENOATTR
-		} else {
-			m.genLog(ctx, s, time.Now().UnixNano(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
-			return nil
 		}
+		now := time.Now().UnixNano()
+		nd.setCtime(now)
+		if _, err = s.Cols("ctime", "ctimensec").Update(&nd, &node{Inode: inode}); err != nil {
+			return err
+		}
+		m.genLog(ctx, s, now, "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
+		return nil
 	}))
 }
 
