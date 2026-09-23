@@ -39,6 +39,8 @@ import (
 
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -193,6 +195,7 @@ func testMeta(t *testing.T, m Meta) {
 	testSnapshot(t, m)
 	testSnapshotConsistency(t, m)
 	testSnapshotHardlinks(t, m)
+	testSnapshotHolds(t, m)
 	testSnapshotLeakedInodes(t, m)
 	testSnapshotCompact(t, m)
 	testSnapshotDelete(t, m)
@@ -5370,6 +5373,239 @@ func testSnapshotHardlinks(t *testing.T, m Meta) {
 	if st := m.GetAttr(ctx, file, &attr); st != 0 || attr.Nlink != 4 {
 		t.Fatalf("the source lost links: %s, nlink %d", st, attr.Nlink)
 	}
+}
+
+// testSnapshotHolds checks that a held snapshot cannot be deleted, that holds are
+// independent named references, and that a hold racing a delete never loses.
+func testSnapshotHolds(t *testing.T, m Meta) {
+	ctx := Background()
+	var dir, file Ino
+	if st := m.Mkdir(ctx, RootInode, "holdSrc", 0755, 022, 0, &dir, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Create(ctx, dir, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	holdsOf := func(name string) []string {
+		snaps, st := m.ListSnapshots(ctx)
+		if st != 0 {
+			t.Fatalf("list snapshots: %s", st)
+		}
+		for _, s := range snaps {
+			if s.Name == name {
+				return s.Holds
+			}
+		}
+		t.Fatalf("snapshot %s is not listed", name)
+		return nil
+	}
+
+	if st := m.SetXattr(ctx, dir, "user.k", []byte("v"), 0); st != 0 {
+		t.Fatalf("setxattr: %s", st)
+	}
+	root, st := m.CreateSnapshot(ctx, dir, "held", false, nil, nil)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	// a hold is not snapshot content: the root looks the same held or not
+	seen := func() (Attr, string) {
+		var a Attr
+		if st := m.GetAttr(ctx, root, &a); st != 0 {
+			t.Fatalf("getattr the snapshot root: %s", st)
+		}
+		var names []byte
+		if st := m.ListXattr(ctx, root, &names); st != 0 {
+			t.Fatalf("listxattr the snapshot root: %s", st)
+		}
+		return a, string(names)
+	}
+	unheldAttr, unheldNames := seen()
+	unchanged := func(when string) {
+		a, names := seen()
+		if a != unheldAttr {
+			t.Fatalf("the snapshot root changed %s: %+v, was %+v", when, a, unheldAttr)
+		}
+		if names != unheldNames {
+			t.Fatalf("the snapshot root lists other attributes %s: %q, was %q", when, names, unheldNames)
+		}
+	}
+	for _, tag := range []string{"backup-1", "replica"} {
+		if st := m.HoldSnapshot(ctx, "held", tag); st != 0 {
+			t.Fatalf("hold %s: %s", tag, st)
+		}
+	}
+	unchanged("when held")
+	var value []byte
+	if st := m.GetXattr(ctx, root, snapshotHoldPrefix+"replica", &value); st != ENOATTR {
+		t.Fatalf("a hold read as an attribute should be ENOATTR, got %s", st)
+	}
+	if st := m.HoldSnapshot(ctx, "held", "backup-1"); st != syscall.EEXIST {
+		t.Fatalf("a second hold with one tag should be EEXIST, got %s", st)
+	}
+	if st := m.ReleaseSnapshot(ctx, "held", "nobody"); st != ENOATTR {
+		t.Fatalf("releasing a tag never held should be ENOATTR, got %s", st)
+	}
+	if st := m.HoldSnapshot(ctx, "missing", "x"); st != syscall.ENOENT {
+		t.Fatalf("holding a snapshot that does not exist should be ENOENT, got %s", st)
+	}
+	for _, tag := range []string{"", strings.Repeat("t", 201), "a\x00b", "a\nb", "a\x7fb", "\xff"} {
+		if st := m.HoldSnapshot(ctx, "held", tag); st != syscall.EINVAL {
+			t.Fatalf("tag %q should be EINVAL, got %s", tag, st)
+		}
+	}
+	for _, tag := range []string{strings.Repeat("t", 200), "sauvegarde-été-Ωμέγα", "a.b/c:d=e@f g"} {
+		if st := m.HoldSnapshot(ctx, "held", tag); st != 0 {
+			t.Fatalf("hold %q: %s", tag, st)
+		}
+		if st := m.ReleaseSnapshot(ctx, "held", tag); st != 0 {
+			t.Fatalf("release %q: %s", tag, st)
+		}
+	}
+	if h := holdsOf("held"); len(h) != 2 || h[0] != "backup-1" || h[1] != "replica" {
+		t.Fatalf("holds %v, want [backup-1 replica]", h)
+	}
+	// each hold on its own keeps the snapshot
+	if st := m.DeleteSnapshot(ctx, "held", nil); st != syscall.EBUSY {
+		t.Fatalf("deleting a held snapshot should be EBUSY, got %s", st)
+	}
+	if st := m.ReleaseSnapshot(ctx, "held", "backup-1"); st != 0 {
+		t.Fatalf("release: %s", st)
+	}
+	if st := m.DeleteSnapshot(ctx, "held", nil); st != syscall.EBUSY {
+		t.Fatalf("a snapshot with one hold left should be EBUSY, got %s", st)
+	}
+	var attr Attr
+	var ino Ino
+	if st := m.Lookup(ctx, root, "f", &ino, &attr, false); st != 0 {
+		t.Fatalf("a refused delete damaged the snapshot: %s", st)
+	}
+	// holds are not extended attributes anyone can forge or clear
+	name := snapshotHoldPrefix + "forged"
+	for _, target := range []Ino{file, dir, root} {
+		if st := m.SetXattr(ctx, target, name, []byte("x"), 0); st != syscall.EPERM {
+			t.Fatalf("setting a hold attribute on %d should be EPERM, got %s", target, st)
+		}
+	}
+	if st := m.RemoveXattr(ctx, root, snapshotHoldPrefix+"replica"); st != syscall.EPERM {
+		t.Fatalf("removing a hold as an attribute should be EPERM, got %s", st)
+	}
+	// a copy of a held snapshot is not held
+	var copyIno Ino
+	var cloned, total uint64
+	if st := m.Clone(ctx, SnapshotInode, root, RootInode, "heldCopy", 0, 022, 1, &cloned, &total); st != 0 {
+		t.Fatalf("clone the snapshot: %s", st)
+	}
+	if st := m.Lookup(ctx, RootInode, "heldCopy", &copyIno, &attr, false); st != 0 {
+		t.Fatalf("lookup the copy: %s", st)
+	}
+	var names []byte
+	if st := m.ListXattr(ctx, copyIno, &names); st != 0 {
+		t.Fatalf("listxattr the copy: %s", st)
+	}
+	if strings.Contains(string(names), snapshotHoldPrefix) {
+		t.Fatalf("the copy of a held snapshot carries its holds: %q", names)
+	}
+	if st := m.ReleaseSnapshot(ctx, "held", "replica"); st != 0 {
+		t.Fatalf("release: %s", st)
+	}
+	unchanged("once released")
+	if st := m.DeleteSnapshot(ctx, "held", nil); st != 0 {
+		t.Fatalf("delete once released: %s", st)
+	}
+
+	// a hold and a delete racing: whichever wins, the other one sees it. Within
+	// one client both take the same in-process lock, so they race from two
+	// clients where the engine allows it, and meet in its transactions.
+	peer := peerClient(t, m)
+	if peer == nil {
+		peer = m
+	}
+	restarts := txRestarts(m) + txRestarts(peer)
+	var holdsWon, deletesWon int
+	for i := 0; i < 40; i++ {
+		name := fmt.Sprintf("race%d", i)
+		if _, st := m.CreateSnapshot(ctx, dir, name, false, nil, nil); st != 0 {
+			t.Fatalf("create %s: %s", name, st)
+		}
+		holder, deleter := m, peer
+		if i%2 == 1 {
+			holder, deleter = peer, m
+		}
+		var hold, del syscall.Errno
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			// the delete looks the snapshot up first: spread where the hold lands
+			time.Sleep(time.Duration(i%8) * 250 * time.Microsecond)
+			hold = holder.HoldSnapshot(ctx, name, "racer")
+		}()
+		go func() { defer wg.Done(); del = deleter.DeleteSnapshot(ctx, name, nil) }()
+		wg.Wait()
+		switch {
+		case hold == 0 && del == syscall.EBUSY:
+			holdsWon++
+			if h := holdsOf(name); len(h) != 1 {
+				t.Fatalf("%s: held and kept, but holds are %v", name, h)
+			}
+			if st := m.ReleaseSnapshot(ctx, name, "racer"); st != 0 {
+				t.Fatalf("release %s: %s", name, st)
+			}
+			if st := m.DeleteSnapshot(ctx, name, nil); st != 0 {
+				t.Fatalf("delete %s: %s", name, st)
+			}
+		case del == 0 && hold == syscall.ENOENT:
+			deletesWon++
+		default:
+			t.Fatalf("%s: hold %s and delete %s, one of them should have seen the other", name, hold, del)
+		}
+	}
+	t.Logf("hold/delete race on %s across two clients: %t, holds won %d, deletes won %d, transaction restarts %.0f",
+		m.Name(), peer != m, holdsWon, deletesWon, txRestarts(m)+txRestarts(peer)-restarts)
+}
+
+// peerClient opens a second client on the metadata of m, with in-process locks
+// of its own, so that what the two do at once meets in the metadata engine. It
+// returns nil for the engines that a single process owns.
+func peerClient(t *testing.T, m Meta) Meta {
+	addr := m.getBase().addr
+	var peer Meta
+	var err error
+	switch name := m.Name(); name {
+	case "redis":
+		peer, err = newRedisMeta(name, addr, testConfig())
+	case "sqlite3", "mysql", "postgres":
+		peer, err = newSQLMeta(name, strings.TrimPrefix(addr, "postgres://"), testConfig())
+	case "tikv", "etcd", "fdb":
+		peer, err = newKVMeta(name, addr, testConfig())
+	default:
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("open a second client: %s", err)
+	}
+	if _, err = peer.Load(true); err != nil {
+		t.Fatalf("load the second client: %s", err)
+	}
+	t.Cleanup(func() { _ = peer.Shutdown() })
+	return peer
+}
+
+// txRestarts is how many transactions of m have been restarted on a conflict.
+func txRestarts(m Meta) float64 {
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		m.getBase().txRestart.Collect(ch)
+		close(ch)
+	}()
+	var n float64
+	for c := range ch {
+		var d dto.Metric
+		if c.Write(&d) == nil {
+			n += d.GetCounter().GetValue()
+		}
+	}
+	return n
 }
 
 func testSnapshotCompact(t *testing.T, m Meta) {

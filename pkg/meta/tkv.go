@@ -3428,6 +3428,9 @@ func (m *kvMeta) doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) s
 
 func (m *kvMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
 	defer m.timeit("GetXattr", time.Now())
+	if strings.HasPrefix(name, snapshotHoldPrefix) {
+		return ENOATTR
+	}
 	inode = m.checkRoot(inode)
 	buf, err := m.get(m.xattrKey(inode, name))
 	if err != nil {
@@ -3487,6 +3490,9 @@ func (m *kvMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 	*names = nil
 	prefix := len(m.xattrKey(inode, ""))
 	for _, name := range keys {
+		if bytes.HasPrefix(name[prefix:], []byte(snapshotHoldPrefix)) {
+			continue
+		}
 		*names = append(*names, name[prefix:]...)
 		*names = append(*names, 0)
 	}
@@ -4916,6 +4922,9 @@ func (m *kvMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string
 		if _, ino := m.parseEntry(buf); ino != inode {
 			return syscall.ENOENT
 		}
+		if tx.exist(m.xattrKey(inode, snapshotHoldPrefix)) {
+			return syscall.EBUSY
+		}
 		var pattr Attr
 		m.parseAttr(a, &pattr)
 		pattr.Nlink--
@@ -4930,6 +4939,33 @@ func (m *kvMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string
 		m.genLog(tx, now, "DETACH(%d,%d,%s)", inode, parent, logEncode2(name))
 		return nil
 	}, parent))
+}
+
+func (m *kvMeta) doSnapshotHold(ctx Context, name, key string, value []byte, hold bool) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		entry := tx.get(m.entryKey(SnapshotInode, name))
+		if entry == nil {
+			return syscall.ENOENT
+		}
+		// written back unchanged, so that a delete racing with this conflicts with
+		// it even where transactions only detect conflicting writes
+		tx.set(m.entryKey(SnapshotInode, name), entry)
+		_, root := m.parseEntry(entry)
+		k := m.xattrKey(root, key)
+		held := tx.get(k) != nil
+		if hold {
+			if held {
+				return syscall.EEXIST
+			}
+			tx.set(k, value)
+			return nil
+		}
+		if !held {
+			return ENOATTR
+		}
+		tx.delete(k)
+		return nil
+	}, SnapshotInode))
 }
 
 func (m *kvMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {

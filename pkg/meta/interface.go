@@ -572,8 +572,14 @@ type Meta interface {
 	CreateSnapshot(ctx Context, src Ino, name string, bestEffort bool, count, total *uint64) (Ino, syscall.Errno)
 	// ListSnapshots returns every snapshot of this volume.
 	ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno)
-	// DeleteSnapshot removes a snapshot and releases what it pinned.
+	// DeleteSnapshot removes a snapshot and releases what it pinned. A held
+	// snapshot is refused with EBUSY.
 	DeleteSnapshot(ctx Context, name string, count *uint64) syscall.Errno
+	// HoldSnapshot adds the hold tag to a snapshot, which cannot be deleted while
+	// it has any hold.
+	HoldSnapshot(ctx Context, name, tag string) syscall.Errno
+	// ReleaseSnapshot removes the hold tag from a snapshot.
+	ReleaseSnapshot(ctx Context, name, tag string) syscall.Errno
 	// Clone a file or directory
 	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno
 	// GetPaths returns all paths of an inode

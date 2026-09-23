@@ -19,7 +19,9 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -49,6 +51,10 @@ first copy is kept whatever changed, so it may hold only some of the changes
 made during the copy. Data a client has written but not yet flushed is never
 part of a snapshot.
 
+A hold, named by a tag, keeps a snapshot from being deleted until it is
+released, so that a backup or a transfer reading from it cannot lose it. A
+snapshot can have several holds; delete fails while it has any.
+
 Examples:
 # Snapshot the whole volume
 $ juicefs snapshot create redis://localhost --path / --name daily-2026-08-20
@@ -56,8 +62,12 @@ $ juicefs snapshot create redis://localhost --path / --name daily-2026-08-20
 # Snapshot one directory
 $ juicefs snapshot create redis://localhost --path /data --name before-upgrade
 
-# List them
+# List them, with their holds
 $ juicefs snapshot list redis://localhost
+
+# Keep one while a backup reads from it, then let it go
+$ juicefs snapshot hold redis://localhost --name before-upgrade --tag backup-123
+$ juicefs snapshot release redis://localhost --name before-upgrade --tag backup-123
 
 # Delete one, releasing the data only it referenced
 $ juicefs snapshot delete redis://localhost --name before-upgrade`,
@@ -75,6 +85,10 @@ $ juicefs snapshot delete redis://localhost --name before-upgrade`,
 			&cli.BoolFlag{
 				Name:  "best-effort",
 				Usage: "keep the copy even if the tree changes while it is taken (create only)",
+			},
+			&cli.StringFlag{
+				Name:  "tag",
+				Usage: "name of the hold (hold and release only)",
 			},
 		},
 		Subcommands: []*cli.Command{
@@ -95,6 +109,18 @@ $ juicefs snapshot delete redis://localhost --name before-upgrade`,
 				Usage:     "Delete a snapshot and release the data only it referenced",
 				ArgsUsage: "META-URL",
 				Action:    snapshotDelete,
+			},
+			{
+				Name:      "hold",
+				Usage:     "Keep a snapshot from being deleted until the hold is released",
+				ArgsUsage: "META-URL",
+				Action:    func(c *cli.Context) error { return holdOrRelease(c, true) },
+			},
+			{
+				Name:      "release",
+				Usage:     "Release a hold on a snapshot",
+				ArgsUsage: "META-URL",
+				Action:    func(c *cli.Context) error { return holdOrRelease(c, false) },
 			},
 		},
 	}
@@ -171,7 +197,7 @@ func snapshotList(c *cli.Context) error {
 	// snapshots are not charged against capacity or quotas, so this is where their
 	// usage shows up; they are immutable, so the figures cannot go stale
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "NAME\tCREATED\tINODES\tSIZE\tPATH")
+	_, _ = fmt.Fprintln(w, "NAME\tCREATED\tINODES\tSIZE\tHOLDS\tPATH")
 	var inodes, size uint64
 	for _, s := range snaps {
 		var sum meta.Summary
@@ -180,10 +206,14 @@ func snapshotList(c *cli.Context) error {
 		}
 		inodes += sum.Dirs + sum.Files
 		size += sum.Size
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%s\t/%s/%s\n", s.Name, s.Created.Format(time.RFC3339),
-			sum.Dirs+sum.Files, humanize.IBytes(sum.Size), meta.SnapshotName, s.Name)
+		holds := "-"
+		if len(s.Holds) > 0 {
+			holds = strings.Join(s.Holds, ",")
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t/%s/%s\n", s.Name, s.Created.Format(time.RFC3339),
+			sum.Dirs+sum.Files, humanize.IBytes(sum.Size), holds, meta.SnapshotName, s.Name)
 	}
-	_, _ = fmt.Fprintf(w, "(%d snapshots)\t\t%d\t%s\t\n", len(snaps), inodes, humanize.IBytes(size))
+	_, _ = fmt.Fprintf(w, "(%d snapshots)\t\t%d\t%s\t\t\n", len(snaps), inodes, humanize.IBytes(size))
 	return w.Flush()
 }
 
@@ -234,9 +264,62 @@ func snapshotDelete(c *cli.Context) error {
 	spin.SetCurrent(int64(count))
 	spin.Done()
 	progress.Done()
+	if st == syscall.EBUSY {
+		return fmt.Errorf("snapshot %s is held (%s), release its holds first", name, holdsOf(m, name))
+	}
 	if st != 0 {
 		return fmt.Errorf("delete snapshot %s: %s", name, st)
 	}
 	logger.Infof("snapshot %s deleted (%d entries)", name, count)
+	return nil
+}
+
+// holdsOf names the holds on snapshot name, for an error message.
+func holdsOf(m meta.Meta, name string) string {
+	snaps, st := m.ListSnapshots(meta.Background())
+	if st == 0 {
+		for _, s := range snaps {
+			if s.Name == name {
+				return strings.Join(s.Holds, ", ")
+			}
+		}
+	}
+	return "holds unknown"
+}
+
+func holdOrRelease(c *cli.Context, hold bool) error {
+	setup(c, 1)
+	removePassword(c.Args().Get(0))
+	m := meta.NewClient(c.Args().Get(0), nil)
+	if _, err := m.Load(true); err != nil {
+		return err
+	}
+	defer func() { _ = m.Shutdown() }()
+
+	name, tag := c.String("name"), c.String("tag")
+	if name == "" || tag == "" {
+		return fmt.Errorf("please give the snapshot with --name and the hold with --tag")
+	}
+	var st syscall.Errno
+	if hold {
+		st = m.HoldSnapshot(meta.Background(), name, tag)
+	} else {
+		st = m.ReleaseSnapshot(meta.Background(), name, tag)
+	}
+	switch {
+	case st == syscall.ENOENT:
+		return fmt.Errorf("no snapshot named %s", name)
+	case hold && st == syscall.EEXIST:
+		return fmt.Errorf("snapshot %s already has a hold named %s", name, tag)
+	case !hold && st == meta.ENOATTR:
+		return fmt.Errorf("snapshot %s has no hold named %s", name, tag)
+	case st != 0:
+		return fmt.Errorf("snapshot %s, hold %s: %s", name, tag, st)
+	}
+	if hold {
+		logger.Infof("snapshot %s held by %s", name, tag)
+	} else {
+		logger.Infof("hold %s on snapshot %s released", tag, name)
+	}
 	return nil
 }

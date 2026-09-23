@@ -4305,6 +4305,9 @@ func (m *redisMeta) doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool
 
 func (m *redisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
 	defer m.timeit("GetXattr", time.Now())
+	if strings.HasPrefix(name, snapshotHoldPrefix) {
+		return ENOATTR
+	}
 	inode = m.checkRoot(inode)
 	var err error
 	*vbuff, err = m.rdb.HGet(ctx, m.xattrKey(inode), name).Bytes()
@@ -4323,6 +4326,9 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 	}
 	*names = nil
 	for _, name := range vals {
+		if strings.HasPrefix(name, snapshotHoldPrefix) {
+			continue
+		}
 		*names = append(*names, []byte(name)...)
 		*names = append(*names, 0)
 	}
@@ -5953,6 +5959,15 @@ func (m *redisMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name str
 		if _, ino := m.parseEntry(buf); ino != inode {
 			return syscall.ENOENT
 		}
+		keys, err := tx.HKeys(ctx, m.xattrKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			if strings.HasPrefix(k, snapshotHoldPrefix) {
+				return syscall.EBUSY
+			}
+		}
 		var pattr Attr
 		m.parseAttr(a, &pattr)
 		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
@@ -5969,7 +5984,47 @@ func (m *redisMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name str
 			return nil
 		})
 		return err
-	}, m.inodeKey(parent), m.entryKey(parent)))
+	}, m.inodeKey(parent), m.entryKey(parent), m.xattrKey(inode)))
+}
+
+func (m *redisMeta) doSnapshotHold(ctx Context, name, key string, value []byte, hold bool) syscall.Errno {
+	buf, err := m.rdb.HGet(ctx, m.entryKey(SnapshotInode), name).Bytes()
+	if err == redis.Nil {
+		return syscall.ENOENT
+	} else if err != nil {
+		return errno(err)
+	}
+	_, root := m.parseEntry(buf)
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		buf, err := tx.HGet(ctx, m.entryKey(SnapshotInode), name).Bytes()
+		if err == redis.Nil {
+			return syscall.ENOENT
+		} else if err != nil {
+			return err
+		}
+		if _, ino := m.parseEntry(buf); ino != root {
+			return syscall.ENOENT
+		}
+		held, err := tx.HExists(ctx, m.xattrKey(root), key).Result()
+		if err != nil {
+			return err
+		}
+		if hold && held {
+			return syscall.EEXIST
+		}
+		if !hold && !held {
+			return ENOATTR
+		}
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			if hold {
+				p.HSet(ctx, m.xattrKey(root), key, value)
+			} else {
+				p.HDel(ctx, m.xattrKey(root), key)
+			}
+			return nil
+		})
+		return err
+	}, m.entryKey(SnapshotInode), m.xattrKey(root)))
 }
 
 func (m *redisMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {

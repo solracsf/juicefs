@@ -35,6 +35,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/meta/pb"
@@ -139,6 +141,9 @@ type engine interface {
 	// doSnapshotLink adds parent/name as another link to inode, a file already
 	// copied into a snapshot under construction; flags and times are left alone
 	doSnapshotLink(ctx Context, inode, parent Ino, name string) syscall.Errno
+	// doSnapshotHold adds (hold) or removes the extended attribute key on the root
+	// of snapshot name, in the transaction that checks the snapshot is still there
+	doSnapshotHold(ctx Context, name, key string, value []byte, hold bool) syscall.Errno
 	doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno
 	doTouchAtime(ctx Context, inode Ino, attr *Attr, ts time.Time) (bool, error)
 	doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno)
@@ -2356,6 +2361,9 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	default:
 		return syscall.EINVAL
 	}
+	if strings.HasPrefix(name, snapshotHoldPrefix) {
+		return syscall.EPERM
+	}
 
 	defer m.timeit("SetXattr", time.Now())
 	inode = m.checkRoot(inode)
@@ -2371,6 +2379,10 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	}
 	if name == "" {
 		return syscall.EINVAL
+	}
+
+	if strings.HasPrefix(name, snapshotHoldPrefix) {
+		return syscall.EPERM
 	}
 
 	defer m.timeit("RemoveXattr", time.Now())
@@ -3176,6 +3188,7 @@ type SnapshotInfo struct {
 	Inode   Ino
 	Name    string
 	Created time.Time
+	Holds   []string // tags of the holds that keep it from being deleted
 }
 
 // checkSnapshotSessions refuses to freeze a tree while a client too old to
@@ -3206,6 +3219,14 @@ const snapshotHeartbeat = time.Hour
 // snapshotAttempts bounds how many times a snapshot is retried while its tree
 // keeps changing under the copy.
 const snapshotAttempts = 3
+
+// snapshotHoldPrefix names the extended attributes that hold a snapshot root:
+// one per tag, set and removed only through HoldSnapshot and ReleaseSnapshot.
+const snapshotHoldPrefix = "juicefs.snapshot.hold."
+
+// maxHoldTag keeps the attribute a hold is stored as well within the 255 bytes
+// an extended attribute name may take.
+const maxHoldTag = 200
 
 // storedFormat reads the format as the metadata engine holds it, which may be
 // newer than the copy this client loaded.
@@ -3482,6 +3503,14 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 	if st != 0 {
 		return st
 	}
+	// holds are taken on a snapshot after it is published and are not part of it
+	for _, xs := range []map[string][]byte{sx, dx} {
+		for k := range xs {
+			if strings.HasPrefix(k, snapshotHoldPrefix) {
+				delete(xs, k)
+			}
+		}
+	}
 	if len(sx) != len(dx) {
 		differs.Store(true)
 		return 0
@@ -3613,16 +3642,56 @@ func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
 	}
 	snaps := make([]*SnapshotInfo, 0, len(entries))
 	for _, e := range entries {
+		holds, st := m.snapshotHolds(ctx, e.Inode)
+		if st != 0 {
+			return nil, st
+		}
 		snaps = append(snaps, &SnapshotInfo{Inode: e.Inode, Name: string(e.Name),
-			Created: time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec))})
+			Created: time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec)), Holds: holds})
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Name < snaps[j].Name })
 	return snaps, 0
 }
 
-// cloneFlags returns the flags a cloned inode carries. A snapshot freezes its
-// copies; a copy leaving a snapshot drops the freeze, or its flags could never
-// be changed again by anyone.
+// HoldSnapshot adds the hold tag to snapshot name. A hold is a named reference,
+// like a ZFS user hold: the snapshot cannot be deleted while it has any, which
+// lets a backup or a transfer keep the snapshot it reads from.
+func (m *baseMeta) HoldSnapshot(ctx Context, name, tag string) syscall.Errno {
+	return m.holdSnapshot(ctx, name, tag, true)
+}
+
+// ReleaseSnapshot removes the hold tag from snapshot name.
+func (m *baseMeta) ReleaseSnapshot(ctx Context, name, tag string) syscall.Errno {
+	return m.holdSnapshot(ctx, name, tag, false)
+}
+
+func (m *baseMeta) holdSnapshot(ctx Context, name, tag string, hold bool) syscall.Errno {
+	if m.conf.ReadOnly {
+		return syscall.EROFS
+	}
+	if tag == "" || len(tag) > maxHoldTag || !utf8.ValidString(tag) || strings.ContainsFunc(tag, unicode.IsControl) {
+		return syscall.EINVAL
+	}
+	since := []byte(time.Now().UTC().Format(time.RFC3339))
+	return m.en.doSnapshotHold(ctx, name, snapshotHoldPrefix+tag, since, hold)
+}
+
+// snapshotHolds returns the tags of the holds on a snapshot root.
+func (m *baseMeta) snapshotHolds(ctx Context, root Ino) ([]string, syscall.Errno) {
+	xs, st := m.en.doGetXattrs(ctx, root)
+	if st != 0 {
+		return nil, st
+	}
+	var tags []string
+	for k := range xs {
+		if strings.HasPrefix(k, snapshotHoldPrefix) {
+			tags = append(tags, k[len(snapshotHoldPrefix):])
+		}
+	}
+	sort.Strings(tags)
+	return tags, 0
+}
+
 // snapshotLimitReached reports whether parent is the snapshot root and already
 // holds MaxSnapshots snapshots: each one is a subdirectory, so nlink counts them.
 func (m *baseMeta) snapshotLimitReached(parent Ino, nlink uint32) bool {
@@ -3630,6 +3699,9 @@ func (m *baseMeta) snapshotLimitReached(parent Ino, nlink uint32) bool {
 	return parent == SnapshotInode && limit > 0 && int(nlink)-2 >= limit
 }
 
+// cloneFlags returns the flags a cloned inode carries. A snapshot freezes its
+// copies; a copy leaving a snapshot drops the freeze, or its flags could never
+// be changed again by anyone.
 func cloneFlags(flags, cmode uint8) uint8 {
 	if cmode&CLONE_MODE_SNAPSHOT != 0 {
 		return flags | FlagSnapshot | FlagImmutable
@@ -4074,6 +4146,18 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	eno := m.en.doCloneEntry(ctx, srcIno, parent, name, ino, &attr, cmode, cumask, top)
 	if eno != 0 {
 		return eno
+	}
+	// holds belong to a snapshot, not to the copies made of it
+	if srcIno.IsSnapshot() {
+		holds, st := m.snapshotHolds(ctx, ino)
+		if st != 0 {
+			return st
+		}
+		for _, tag := range holds {
+			if st := m.en.doRemoveXattr(ctx, ino, snapshotHoldPrefix+tag); st != 0 {
+				return st
+			}
+		}
 	}
 	// snapshots are exempt from capacity and quotas; snapshot list reports them
 	if cmode&CLONE_MODE_SNAPSHOT == 0 {

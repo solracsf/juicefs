@@ -4317,6 +4317,9 @@ func (m *dbMeta) doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) s
 
 func (m *dbMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
 	defer m.timeit("GetXattr", time.Now())
+	if strings.HasPrefix(name, snapshotHoldPrefix) {
+		return ENOATTR
+	}
 	inode = m.checkRoot(inode)
 	return errno(m.simpleTxn(ctx, func(s *xorm.Session) error {
 		var x = xattr{Inode: inode, Name: name}
@@ -4382,6 +4385,9 @@ func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 		}
 		*names = nil
 		for _, x := range xs {
+			if strings.HasPrefix(x.Name, snapshotHoldPrefix) {
+				continue
+			}
 			*names = append(*names, []byte(x.Name)...)
 			*names = append(*names, 0)
 		}
@@ -5997,6 +6003,13 @@ func (m *dbMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string
 		if !ok || e.Inode != inode {
 			return syscall.ENOENT
 		}
+		held, err := s.Where("inode = ? AND name LIKE ?", inode, snapshotHoldPrefix+"%").Count(&xattr{})
+		if err != nil {
+			return err
+		}
+		if held > 0 {
+			return syscall.EBUSY
+		}
 		if err = deleteEdge(s, &e); err != nil {
 			return err
 		}
@@ -6013,6 +6026,41 @@ func (m *dbMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string
 		m.genLog(ctx, s, now, "DETACH(%d,%d,%s)", inode, parent, logEncode2(name))
 		return nil
 	}, parent))
+}
+
+func (m *dbMeta) doSnapshotHold(ctx Context, name, key string, value []byte, hold bool) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		// the lock a delete takes too, so that the two never interleave
+		ok, err := s.ForUpdate().Get(&node{Inode: SnapshotInode})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return syscall.ENOENT
+		}
+		e, ok, err := m.getEdge(ctx, s, SnapshotInode, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return syscall.ENOENT
+		}
+		held, err := s.Get(&xattr{Inode: e.Inode, Name: key})
+		if err != nil {
+			return err
+		}
+		if hold {
+			if held {
+				return syscall.EEXIST
+			}
+			return mustInsert(s, &xattr{Inode: e.Inode, Name: key, Value: value})
+		}
+		if !held {
+			return ENOATTR
+		}
+		_, err = s.Delete(&xattr{Inode: e.Inode, Name: key})
+		return err
+	}, SnapshotInode))
 }
 
 func (m *dbMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {

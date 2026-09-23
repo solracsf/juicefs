@@ -26,6 +26,7 @@ import (
 	"path"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -946,6 +947,9 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if st != 0 {
 					t.Fatalf("create snapshot: %s", st)
 				}
+				if st := src.HoldSnapshot(ctx, "s1", "keep"); st != 0 {
+					t.Fatalf("hold snapshot: %s", st)
+				}
 				src.getBase().doFlushStats()
 
 				var buf bytes.Buffer
@@ -978,6 +982,12 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				snaps, st := dst.ListSnapshots(ctx)
 				if st != 0 || len(snaps) != 1 || snaps[0].Name != "s1" || snaps[0].Inode != snap {
 					t.Fatalf("snapshots after load: %+v %s, want s1 at %d", snaps, st, snap)
+				}
+				if h := snaps[0].Holds; len(h) != 1 || h[0] != "keep" {
+					t.Fatalf("holds after load: %v, want [keep]", h)
+				}
+				if st := dst.DeleteSnapshot(ctx, "s1", nil); st != syscall.EBUSY {
+					t.Fatalf("a snapshot held before the dump should still refuse deletion, got %s", st)
 				}
 				for _, ino := range []Ino{SnapshotInode, snap} {
 					var want, got Attr
