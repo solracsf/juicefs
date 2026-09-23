@@ -2255,7 +2255,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 					pipe.Del(ctx, keys...)
 				}
 				for key, delta := range stats {
-					if delta != 0 {
+					if delta != 0 && !skipUsage(ctx) {
 						pipe.IncrBy(ctx, key, delta)
 					}
 				}
@@ -2286,7 +2286,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 
 		// outside of transaction: trigger data deletion callbacks
 		for inode, info := range delNodes {
-			m.fileDeleted(info.opened, parent.IsTrash(), inode, info.length)
+			m.fileDeleted(info.opened, parent.IsTrash() || skipUsage(ctx), inode, info.length)
 		}
 
 		delta.length += batchDirLength
@@ -2295,9 +2295,11 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 		if trash > 0 && (batchTrashSpace != 0 || batchTrashInodes != 0) {
 			m.updateDirStat(ctx, trash, batchTrashLength, batchTrashSpace, batchTrashInodes)
 		}
-		m.updateStats(batchFsSpace, batchFsInodes)
-		for _, q := range deltas {
-			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+		if !skipUsage(ctx) {
+			m.updateStats(batchFsSpace, batchFsInodes)
+			for _, q := range deltas {
+				m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+			}
 		}
 	}
 	return 0
@@ -2400,8 +2402,10 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 			} else {
 				pipe.Del(ctx, m.inodeKey(inode))
 				pipe.Del(ctx, m.xattrKey(inode))
-				pipe.IncrBy(ctx, m.usedSpaceKey(), -align4K(0))
-				pipe.Decr(ctx, m.totalInodesKey())
+				if !skipUsage(ctx) {
+					pipe.IncrBy(ctx, m.usedSpaceKey(), -align4K(0))
+					pipe.Decr(ctx, m.totalInodesKey())
+				}
 			}
 
 			field := inode.String()
@@ -2418,8 +2422,10 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 	}, m.inodeKey(parent), m.entryKey(parent))
 	if err == nil {
 		if trash == 0 {
-			m.updateStats(-align4K(0), -1)
-			m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+			if !skipUsage(ctx) {
+				m.updateStats(-align4K(0), -1)
+				m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+			}
 		} else {
 			m.updateDirStat(ctx, trash, 0, align4K(0), 1)
 		}
@@ -5843,6 +5849,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 }
 
 func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
+	if ino.IsSnapshot() {
+		ctx = withoutUsage(ctx) // a snapshot was never charged, so removing it credits nothing
+	}
 	exists, err := m.rdb.Exists(ctx, m.inodeKey(ino)).Result()
 	if err != nil || exists == 0 {
 		return errno(err)
@@ -5851,13 +5860,17 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if eno := m.emptyDir(withIgnoredAttrFlags(ctx), ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
-	m.updateStats(-align4K(0), -1)
+	if !skipUsage(ctx) {
+		m.updateStats(-align4K(0), -1)
+	}
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		_, err := tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Del(ctx, m.inodeKey(ino))
 			p.Del(ctx, m.xattrKey(ino))
-			p.DecrBy(ctx, m.usedSpaceKey(), align4K(0))
-			p.Decr(ctx, m.totalInodesKey())
+			if !skipUsage(ctx) {
+				p.DecrBy(ctx, m.usedSpaceKey(), align4K(0))
+				p.Decr(ctx, m.totalInodesKey())
+			}
 			field := ino.String()
 			p.HDel(ctx, m.dirUsedInodesKey(), field)
 			p.HDel(ctx, m.dirDataLengthKey(), field)
@@ -5882,6 +5895,44 @@ func (m *redisMeta) doFindDetachedNodes(t time.Time) []Ino {
 		inodes = append(inodes, Ino(inode))
 	}
 	return inodes
+}
+
+func (m *redisMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+		if err != nil {
+			return err
+		}
+		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+		if err == redis.Nil {
+			return syscall.ENOENT
+		} else if err != nil {
+			return err
+		}
+		if _, ino := m.parseEntry(buf); ino != inode {
+			return syscall.ENOENT
+		}
+		var pattr Attr
+		m.parseAttr(a, &pattr)
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.HDel(ctx, m.entryKey(parent), name)
+			pattr.Nlink--
+			now := time.Now()
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			p.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			p.ZAdd(ctx, m.detachedNodes(), redis.Z{Member: inode.String(), Score: 0})
+			m.genLog(ctx, p, now, "DETACH(%d,%d,%s)", inode, parent, logEncode2(name))
+			return nil
+		})
+		return err
+	}, m.inodeKey(parent), m.entryKey(parent)))
+}
+
+func (m *redisMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
+	return errno(m.rdb.ZAddXX(ctx, m.detachedNodes(), redis.Z{Member: inode.String(), Score: float64(time.Now().Unix())}).Err())
 }
 
 func (m *redisMeta) doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name string) syscall.Errno {

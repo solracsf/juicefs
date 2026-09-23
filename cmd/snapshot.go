@@ -19,10 +19,12 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
@@ -48,7 +50,10 @@ $ juicefs snapshot create redis://localhost --path / --name daily-2026-08-20
 $ juicefs snapshot create redis://localhost --path /data --name before-upgrade
 
 # List them
-$ juicefs snapshot list redis://localhost`,
+$ juicefs snapshot list redis://localhost
+
+# Delete one, releasing the data only it referenced
+$ juicefs snapshot delete redis://localhost --name before-upgrade`,
 		HideHelpCommand: true,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -73,6 +78,12 @@ $ juicefs snapshot list redis://localhost`,
 				Usage:     "List the snapshots of a volume",
 				ArgsUsage: "META-URL",
 				Action:    snapshotList,
+			},
+			{
+				Name:      "delete",
+				Usage:     "Delete a snapshot and release the data only it referenced",
+				ArgsUsage: "META-URL",
+				Action:    snapshotDelete,
 			},
 		},
 	}
@@ -163,4 +174,58 @@ func snapshotList(c *cli.Context) error {
 	}
 	_, _ = fmt.Fprintf(w, "(%d snapshots)\t\t%d\t%s\t\n", len(snaps), inodes, humanize.IBytes(size))
 	return w.Flush()
+}
+
+func snapshotDelete(c *cli.Context) error {
+	setup(c, 1)
+	removePassword(c.Args().Get(0))
+	metaConf := meta.DefaultConf()
+	metaConf.NoBGJob = true
+	m := meta.NewClient(c.Args().Get(0), metaConf)
+	format, err := m.Load(true)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Shutdown() }()
+
+	name := c.String("name")
+	if name == "" {
+		return fmt.Errorf("please give the snapshot to delete with --name")
+	}
+	// the blocks only this snapshot referenced are removed as it goes
+	blob, err := createStorage(*format)
+	if err != nil {
+		return fmt.Errorf("object storage: %s", err)
+	}
+	chunkConf := *getDefaultChunkConf(format)
+	chunkConf.CacheDir = "memory"
+	store := chunk.NewCachedStore(blob, chunkConf, nil)
+	m.OnMsg(meta.DeleteSlice, func(args ...interface{}) error {
+		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
+	})
+
+	progress := utils.NewProgress(false)
+	spin := progress.AddCountSpinner("Removed entries")
+	var count uint64
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond * 200):
+				spin.SetCurrent(int64(atomic.LoadUint64(&count)))
+			}
+		}
+	}()
+	st := m.DeleteSnapshot(meta.Background(), name, &count)
+	close(done)
+	spin.SetCurrent(int64(count))
+	spin.Done()
+	progress.Done()
+	if st != 0 {
+		return fmt.Errorf("delete snapshot %s: %s", name, st)
+	}
+	logger.Infof("snapshot %s deleted (%d entries)", name, count)
+	return nil
 }

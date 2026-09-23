@@ -193,6 +193,7 @@ func testMeta(t *testing.T, m Meta) {
 	testSnapshot(t, m)
 	testSnapshotLeakedInodes(t, m)
 	testSnapshotCompact(t, m)
+	testSnapshotDelete(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
 	testAttrFlags(t, m)
@@ -5242,6 +5243,149 @@ func testSnapshotCompact(t *testing.T, m Meta) {
 		if deleted[id] {
 			t.Fatalf("slice %d is still referenced by the snapshot but compaction freed its data", id)
 		}
+	}
+}
+
+// Deleting a snapshot removes its tree at once without crediting the usage it was
+// never charged, and drops its references to the slices it shared. A delete that
+// dies after detaching the root is finished by the reaper.
+func testSnapshotDelete(t *testing.T, m Meta) {
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("new session: %s", err)
+	}
+	defer func() { _ = m.CloseSession() }()
+	ctx := Background()
+	base := m.getBase()
+	var dir, sub, file Ino
+	if st := m.Mkdir(ctx, RootInode, "delSnap", 0777, 022, 0, &dir, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Mkdir(ctx, dir, "sub", 0777, 022, 0, &sub, &Attr{}); st != 0 {
+		t.Fatalf("mkdir sub: %s", st)
+	}
+	if st := m.Create(ctx, sub, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	if st := m.Write(ctx, file, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()); st != 0 {
+		t.Fatalf("write: %s", st)
+	}
+	usage := func() (uint64, uint64) {
+		base.doFlushStats()
+		var total, avail, iused, iavail uint64
+		if st := m.StatFS(ctx, RootInode, &total, &avail, &iused, &iavail); st != 0 {
+			t.Fatalf("statfs: %s", st)
+		}
+		return total - avail, iused
+	}
+
+	root, st := m.CreateSnapshot(ctx, dir, "del1", nil, nil)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	space, inodes := usage()
+	// hold every data-deletion slot for a moment: a delete that gave up on a busy
+	// slot would leave the snapshot's data to some later gc run
+	for i := 0; i < cap(base.maxDeleting); i++ {
+		base.maxDeleting <- struct{}{}
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		for i := 0; i < cap(base.maxDeleting); i++ {
+			<-base.maxDeleting
+		}
+	}()
+	var count uint64
+	if st := m.DeleteSnapshot(ctx, "del1", &count); st != 0 {
+		t.Fatalf("delete snapshot: %s", st)
+	}
+	if count != 2 {
+		t.Fatalf("delete removed %d entries below the root, want 2", count)
+	}
+	if s, i := usage(); s != space || i != inodes {
+		t.Fatalf("delete credited usage it never charged: space %d -> %d, inodes %d -> %d", space, s, inodes, i)
+	}
+	var got Ino
+	var attr Attr
+	if st := m.Lookup(ctx, SnapshotInode, "del1", &got, &attr, false); st != syscall.ENOENT {
+		t.Fatalf("deleted snapshot still resolves: %s", st)
+	}
+	if st := m.GetAttr(ctx, root, &attr); st != syscall.ENOENT {
+		t.Fatalf("deleted snapshot root still exists: %s", st)
+	}
+	for _, ino := range base.en.doFindDetachedNodes(time.Now().Add(time.Hour)) {
+		if ino == root {
+			t.Fatalf("deleted snapshot root %d is still registered as detached", ino)
+		}
+	}
+	// the delete is synchronous: the snapshot's copies no longer hold the slice,
+	// only the original does, so gc may take the blocks once it goes too
+	holders := func() (ours, others bool) {
+		if st := m.ScanSlices(ctx, &ScanSlicesOption{ScanPending: true}, func(ino Ino, s Slice) error {
+			if s.Id == id {
+				if ino == file {
+					ours = true
+				} else {
+					others = true
+				}
+			}
+			return nil
+		}); st != 0 {
+			t.Fatalf("scan slices: %s", st)
+		}
+		return
+	}
+	ours, others := holders()
+	if !ours || others {
+		t.Fatalf("slice %d: held by the original %v, by anything else %v; want only the original", id, ours, others)
+	}
+	if st := m.DeleteSnapshot(ctx, "del1", nil); st != syscall.ENOENT {
+		t.Fatalf("deleting a missing snapshot should be ENOENT, got %s", st)
+	}
+
+	// a delete that died right after detaching is finished by the reaper, at once
+	root2, st := m.CreateSnapshot(ctx, dir, "del2", nil, nil)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	space, inodes = usage()
+	if st := base.en.doDetachDirNode(ctx, SnapshotInode, root2, "del2"); st != 0 {
+		t.Fatalf("detach: %s", st)
+	}
+	reapable := func(ino Ino, edge time.Time) bool {
+		for _, n := range base.en.doFindDetachedNodes(edge) {
+			if n == ino {
+				return true
+			}
+		}
+		return false
+	}
+	if !reapable(root2, time.Now().Add(-24*time.Hour)) {
+		t.Fatalf("a detached snapshot root should be reapable at once")
+	}
+	// a long build refreshes its timestamp so gc does not reap it midway; the
+	// refresh must never register a tree that is not detached
+	if st := base.en.doTouchDetachedNode(ctx, root2); st != 0 {
+		t.Fatalf("touch detached node: %s", st)
+	}
+	if reapable(root2, time.Now().Add(-time.Hour)) {
+		t.Fatalf("a refreshed detached node is still reapable")
+	}
+	if st := base.en.doTouchDetachedNode(ctx, dir); st != 0 {
+		t.Fatalf("touch an attached node: %s", st)
+	}
+	if reapable(dir, time.Now().Add(time.Hour)) {
+		t.Fatalf("touching an attached directory registered it as detached")
+	}
+	m.CleanupDetachedNodesBefore(ctx, time.Now().Add(time.Hour), nil)
+	if st := m.GetAttr(ctx, root2, &attr); st != syscall.ENOENT {
+		t.Fatalf("reaper left the detached snapshot root: %s", st)
+	}
+	if s, i := usage(); s != space || i != inodes {
+		t.Fatalf("reaping a snapshot credited usage: space %d -> %d, inodes %d -> %d", space, s, inodes, i)
 	}
 }
 

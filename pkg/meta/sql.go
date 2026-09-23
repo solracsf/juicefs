@@ -2358,8 +2358,10 @@ func (m *dbMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, attr
 	})
 	if err == nil {
 		if trash == 0 {
-			m.updateStats(-align4K(0), -1)
-			m.updateUserGroupStat(ctx, n.Uid, n.Gid, -align4K(0), -1)
+			if !skipUsage(ctx) {
+				m.updateStats(-align4K(0), -1)
+				m.updateUserGroupStat(ctx, n.Uid, n.Gid, -align4K(0), -1)
+			}
 		} else {
 			m.updateDirStat(ctx, trash, 0, align4K(0), 1)
 		}
@@ -3230,15 +3232,17 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		if trash > 0 && (batchTrashSpace != 0 || batchTrashInodes != 0) {
 			m.updateDirStat(ctx, trash, batchTrashLength, batchTrashSpace, batchTrashInodes)
 		}
-		m.updateStats(batchFsSpace, batchFsInodes)
-		for _, q := range deltas {
-			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+		if !skipUsage(ctx) {
+			m.updateStats(batchFsSpace, batchFsInodes)
+			for _, q := range deltas {
+				m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+			}
 		}
 	}
 
 	// outside of transaction: trigger data deletion callbacks
 	for inode, info := range delNodes {
-		m.fileDeleted(info.opened, parent.IsTrash(), inode, info.length)
+		m.fileDeleted(info.opened, parent.IsTrash() || skipUsage(ctx), inode, info.length)
 	}
 	return 0
 }
@@ -5893,6 +5897,9 @@ func (m *dbMeta) doFindDetachedNodes(t time.Time) []Ino {
 }
 
 func (m *dbMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
+	if ino.IsSnapshot() {
+		ctx = withoutUsage(ctx) // a snapshot was never charged, so removing it credits nothing
+	}
 	exist, err := m.db.Exist(&node{Inode: ino})
 	if err != nil || !exist {
 		return errno(err)
@@ -5901,7 +5908,9 @@ func (m *dbMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if eno := m.emptyDir(withIgnoredAttrFlags(ctx), ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
-	m.updateStats(-align4K(0), -1)
+	if !skipUsage(ctx) {
+		m.updateStats(-align4K(0), -1)
+	}
 	return errno(m.txn(func(s *xorm.Session) error {
 		if _, err := s.Delete(&node{Inode: ino}); err != nil {
 			return err
@@ -5918,6 +5927,48 @@ func (m *dbMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 		}
 		return err
 	}, ino))
+}
+
+func (m *dbMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		var n = node{Inode: parent}
+		ok, err := s.ForUpdate().Get(&n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return syscall.ENOENT
+		}
+		e, ok, err := m.getEdge(ctx, s, parent, name)
+		if err != nil {
+			return err
+		}
+		if !ok || e.Inode != inode {
+			return syscall.ENOENT
+		}
+		if err = deleteEdge(s, &e); err != nil {
+			return err
+		}
+		n.Nlink--
+		now := time.Now().UnixNano()
+		n.setMtime(now)
+		n.setCtime(now)
+		if _, err = s.Cols("nlink", "mtime", "ctime", "mtimensec", "ctimensec").Update(&n, &node{Inode: parent}); err != nil {
+			return err
+		}
+		if err = mustInsert(s, &detachedNode{Inode: inode, Added: 0}); err != nil {
+			return err
+		}
+		m.genLog(ctx, s, now, "DETACH(%d,%d,%s)", inode, parent, logEncode2(name))
+		return nil
+	}, parent))
+}
+
+func (m *dbMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		_, err := s.Cols("added").Update(&detachedNode{Added: time.Now().Unix()}, &detachedNode{Inode: inode})
+		return err
+	}))
 }
 
 func (m *dbMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {

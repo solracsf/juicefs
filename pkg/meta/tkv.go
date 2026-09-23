@@ -2030,7 +2030,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 
 		// Outside of transaction: trigger data deletion callbacks
 		for inode, info := range delNodes {
-			m.fileDeleted(info.opened, parent.IsTrash(), inode, info.length)
+			m.fileDeleted(info.opened, parent.IsTrash() || skipUsage(ctx), inode, info.length)
 		}
 
 		delta.length += batchDirLength
@@ -2039,9 +2039,11 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		if trash > 0 && (batchTrashSpace != 0 || batchTrashInodes != 0) {
 			m.updateDirStat(ctx, trash, batchTrashLength, batchTrashSpace, batchTrashInodes)
 		}
-		m.updateStats(batchFsSpace, batchFsInodes)
-		for _, q := range deltas {
-			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+		if !skipUsage(ctx) {
+			m.updateStats(batchFsSpace, batchFsInodes)
+			for _, q := range deltas {
+				m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
+			}
 		}
 	}
 	return 0
@@ -2154,8 +2156,10 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 	}, parentLocks...)
 	if err == nil {
 		if trash == 0 {
-			m.updateStats(-align4K(0), -1)
-			m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+			if !skipUsage(ctx) {
+				m.updateStats(-align4K(0), -1)
+				m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, -align4K(0), -1)
+			}
 		} else {
 			m.updateDirStat(ctx, trash, 0, align4K(0), 1)
 		}
@@ -4625,6 +4629,9 @@ func (m *kvMeta) doFindDetachedNodes(t time.Time) []Ino {
 }
 
 func (m *kvMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
+	if ino.IsSnapshot() {
+		ctx = withoutUsage(ctx) // a snapshot was never charged, so removing it credits nothing
+	}
 	buf, err := m.get(m.inodeKey(ino))
 	if err != nil || buf == nil {
 		return errno(err)
@@ -4633,7 +4640,9 @@ func (m *kvMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if eno := m.emptyDir(withIgnoredAttrFlags(ctx), ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
-	m.updateStats(-align4K(0), -1)
+	if !skipUsage(ctx) {
+		m.updateStats(-align4K(0), -1)
+	}
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
 		tx.delete(m.inodeKey(ino))
 		tx.deleteKeys(m.xattrKey(ino, ""))
@@ -4839,6 +4848,44 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 
 		return nil
 	}, dstParent))
+}
+
+func (m *kvMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		a := tx.get(m.inodeKey(parent))
+		if a == nil {
+			return syscall.ENOENT
+		}
+		buf := tx.get(m.entryKey(parent, name))
+		if buf == nil {
+			return syscall.ENOENT
+		}
+		if _, ino := m.parseEntry(buf); ino != inode {
+			return syscall.ENOENT
+		}
+		var pattr Attr
+		m.parseAttr(a, &pattr)
+		pattr.Nlink--
+		now := time.Now()
+		pattr.Mtime = now.Unix()
+		pattr.Mtimensec = uint32(now.Nanosecond())
+		pattr.Ctime = now.Unix()
+		pattr.Ctimensec = uint32(now.Nanosecond())
+		tx.set(m.inodeKey(parent), m.marshal(&pattr))
+		tx.delete(m.entryKey(parent, name))
+		tx.set(m.detachedKey(inode), m.packInt64(0))
+		m.genLog(tx, now, "DETACH(%d,%d,%s)", inode, parent, logEncode2(name))
+		return nil
+	}, parent))
+}
+
+func (m *kvMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.detachedKey(inode)) != nil {
+			tx.set(m.detachedKey(inode), m.packInt64(time.Now().Unix()))
+		}
+		return nil
+	}))
 }
 
 func (m *kvMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {

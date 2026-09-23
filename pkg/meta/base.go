@@ -104,6 +104,11 @@ type engine interface {
 	doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name string) syscall.Errno
 	doFindDetachedNodes(t time.Time) []Ino
 	doCleanupDetachedNode(ctx Context, detachedNode Ino) syscall.Errno
+	// doDetachDirNode removes the entry of a directory and registers it as detached
+	// in one transaction, so it can be reaped at once
+	doDetachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno
+	// doTouchDetachedNode refreshes the time of a detached node, if it still is one
+	doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno
 
 	doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error
 	ListSessions() ([]*Session, error)
@@ -1854,7 +1859,7 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 	if name == ".." {
 		return syscall.ENOTEMPTY
 	}
-	if m.hidesEntry(ctx, parent, name) || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() {
+	if m.hidesEntry(ctx, parent, name) || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 || parent.IsSnapshot() && !ignoreAttrFlags(ctx) {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1873,7 +1878,7 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 			m.parentMu.Unlock()
 		}
 		m.updateDirStat(ctx, parent, 0, -align4K(0), -1)
-		if !parent.IsTrash() {
+		if !parent.IsTrash() && !skipUsage(ctx) {
 			m.updateDirQuota(ctx, parent, -align4K(0), -1)
 		}
 	}
@@ -1887,14 +1892,14 @@ func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count 
 	}
 	// reached directly from the Meta interface and from emptyDir, so it needs the
 	// same guard as Unlink rather than relying on the caller having one
-	if parent.IsSnapshot() {
+	if parent.IsSnapshot() && !ignoreAttrFlags(ctx) {
 		return syscall.EPERM
 	}
 	var delta dirStat
 	st := m.en.doBatchUnlink(ctx, parent, entries, &delta, skipCheckTrash)
 	if st == 0 {
 		m.updateDirStat(ctx, parent, delta.length, delta.space, delta.inodes)
-		if !parent.IsTrash() {
+		if !parent.IsTrash() && !skipUsage(ctx) {
 			m.updateDirQuota(ctx, parent, delta.space, delta.inodes)
 		}
 		if count != nil && len(entries) > 0 {
@@ -3178,6 +3183,8 @@ func (m *baseMeta) checkSnapshotSessions(ctx Context) syscall.Errno {
 	return 0
 }
 
+const snapshotHeartbeat = time.Hour
+
 // storedFormat reads the format as the metadata engine holds it, which may be
 // newer than the copy this client loaded.
 func (m *baseMeta) storedFormat() (*Format, error) {
@@ -3338,8 +3345,25 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 	concurrent := make(chan struct{}, CLONE_DEFAULT_CONCURRENCY)
 	dst := root
 	// built detached, so an interrupted snapshot is reaped by the background
-	// cleanup instead of being left half visible under .snapshots
+	// cleanup instead of being left half visible under .snapshots; the timestamp
+	// is kept fresh, or gc would reap a build that outlasts its one-day threshold
+	building := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(snapshotHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-building:
+				return
+			case <-ticker.C:
+				if st := m.en.doTouchDetachedNode(ctx, root); st != 0 {
+					logger.Warnf("refresh snapshot %s under construction: %s", name, st)
+				}
+			}
+		}
+	}()
 	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, concurrent)
+	close(building)
 	if st == 0 {
 		st = m.en.doAttachDirNode(ctx, SnapshotInode, root, name)
 	}
@@ -3350,6 +3374,39 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 		return 0, st
 	}
 	return root, 0
+}
+
+// DeleteSnapshot removes the snapshot called name. Its root is detached first,
+// in one transaction, so a crash leaves a tree for gc to reap rather than half a
+// snapshot on view. The rest is removed here, so the slices it pinned are
+// released now rather than on some later gc run.
+func (m *baseMeta) DeleteSnapshot(ctx Context, name string, count *uint64) syscall.Errno {
+	if m.conf.ReadOnly {
+		return syscall.EROFS
+	}
+	var root Ino
+	if st := m.en.doLookup(ctx, SnapshotInode, name, &root, nil); st != 0 {
+		return st
+	}
+	if st := m.en.doDetachDirNode(ctx, SnapshotInode, root, name); st != 0 {
+		return st
+	}
+	concurrent := make(chan int, RmrDefaultThreads)
+	if st := m.emptyDir(withIgnoredAttrFlags(withoutUsage(ctx)), root, true, count, concurrent); st != 0 {
+		return st
+	}
+	if st := m.en.doCleanupDetachedNode(ctx, root); st != 0 {
+		return st
+	}
+	// file data is removed in the background; wait for it, so the slices this
+	// snapshot alone held are gone when it returns
+	for i := 0; i < cap(m.maxDeleting); i++ {
+		m.maxDeleting <- struct{}{}
+	}
+	for i := 0; i < cap(m.maxDeleting); i++ {
+		<-m.maxDeleting
+	}
+	return 0
 }
 
 // ListSnapshots returns the snapshots under the hidden root, by name.
@@ -3493,6 +3550,19 @@ type ignoreAttrFlagsKey struct{}
 // slices forever.
 func withIgnoredAttrFlags(ctx Context) Context {
 	return ctx.WithValue(ignoreAttrFlagsKey{}, true)
+}
+
+type withoutUsageKey struct{}
+
+// withoutUsage marks the removal of inodes that were never charged to the usage
+// counters or quotas, which is what snapshot content is, so it credits nothing.
+func withoutUsage(ctx Context) Context {
+	return ctx.WithValue(withoutUsageKey{}, true)
+}
+
+func skipUsage(ctx Context) bool {
+	skip, _ := ctx.Value(withoutUsageKey{}).(bool)
+	return skip
 }
 
 func ignoreAttrFlags(ctx Context) bool {
