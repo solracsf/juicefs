@@ -90,6 +90,7 @@ type Format struct {
 	HashPrefix        bool   `json:",omitempty"`
 	Capacity          uint64 `json:",omitempty"`
 	Inodes            uint64 `json:",omitempty"`
+	MaxSnapshots      int    `json:",omitempty"` // 0 means unlimited
 	EncryptKey        string `json:",omitempty"`
 	EncryptAlgo       string `json:",omitempty"`
 	KeyEncrypted      bool   `json:",omitempty"`

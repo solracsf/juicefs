@@ -299,6 +299,14 @@ func config(ctx *cli.Context) error {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, utils.Mbps(format.DownloadLimit), utils.Mbps(new)))
 				format.DownloadLimit = new
 			}
+		case "max-snapshots":
+			if new := ctx.Int(flag); new != format.MaxSnapshots {
+				if new < 0 {
+					return fmt.Errorf("Invalid max snapshots: %d", new)
+				}
+				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.MaxSnapshots, new))
+				format.MaxSnapshots = new
+			}
 		case "trash-days":
 			if new := ctx.Int(flag); new != format.TrashDays {
 				if new < 0 {

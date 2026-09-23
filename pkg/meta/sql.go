@@ -5991,6 +5991,9 @@ func (m *dbMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string
 		if (n.Flags & FlagImmutable) != 0 {
 			return syscall.EPERM
 		}
+		if m.snapshotLimitReached(parent, n.Nlink) {
+			return syscall.EDQUOT
+		}
 		n.Nlink++
 		now := time.Now().UnixNano()
 		n.setMtime(now)

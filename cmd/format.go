@@ -192,6 +192,10 @@ func formatManagementFlags() []cli.Flag {
 			Usage: "hard quota of the volume limiting its number of inodes",
 		},
 		&cli.IntFlag{
+			Name:  "max-snapshots",
+			Usage: "maximum number of snapshots the volume may hold (0 means unlimited)",
+		},
+		&cli.IntFlag{
 			Name:  "trash-days",
 			Value: 1,
 			Usage: "number of days after which removed files will be permanently deleted",
@@ -483,6 +487,8 @@ func format(c *cli.Context) error {
 				format.Capacity = utils.ParseBytes(c, flag, 'G')
 			case "inodes":
 				format.Inodes = c.Uint64(flag)
+			case "max-snapshots":
+				format.MaxSnapshots = c.Int(flag)
 			case "bucket":
 				format.Bucket = c.String(flag)
 			case "access-key":
@@ -539,6 +545,7 @@ func format(c *cli.Context) error {
 			HashPrefix:       c.Bool("hash-prefix"),
 			Capacity:         utils.ParseBytes(c, "capacity", 'G'),
 			Inodes:           c.Uint64("inodes"),
+			MaxSnapshots:     c.Int("max-snapshots"),
 			BlockSize:        int(fixObjectSize(utils.ParseBytes(c, "block-size", 'K')) >> 10),
 			Compression:      c.String("compress"),
 			TrashDays:        c.Int("trash-days"),

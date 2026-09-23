@@ -5952,6 +5952,9 @@ func (m *redisMeta) doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name st
 		if (pattr.Flags & FlagImmutable) != 0 {
 			return syscall.EPERM
 		}
+		if m.snapshotLimitReached(parent, pattr.Nlink) {
+			return syscall.EDQUOT
+		}
 		if tx.HExists(ctx, m.entryKey(parent), name).Val() {
 			return syscall.EEXIST
 		}

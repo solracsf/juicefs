@@ -3323,6 +3323,17 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 	} else if st != syscall.ENOENT {
 		return 0, st
 	}
+	// fail before the copy; the attach checks again, in its transaction
+	if limit := m.getFormat().MaxSnapshots; limit > 0 {
+		var attr Attr
+		if st := m.en.doGetAttr(ctx, SnapshotInode, &attr); st != 0 {
+			return 0, st
+		}
+		if m.snapshotLimitReached(SnapshotInode, attr.Nlink) {
+			logger.Errorf("the volume already holds %d snapshots, its limit", limit)
+			return 0, syscall.EDQUOT
+		}
+	}
 
 	if total != nil {
 		var sum Summary
@@ -3427,6 +3438,13 @@ func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
 // cloneFlags returns the flags a cloned inode carries. A snapshot freezes its
 // copies; a copy leaving a snapshot drops the freeze, or its flags could never
 // be changed again by anyone.
+// snapshotLimitReached reports whether parent is the snapshot root and already
+// holds MaxSnapshots snapshots: each one is a subdirectory, so nlink counts them.
+func (m *baseMeta) snapshotLimitReached(parent Ino, nlink uint32) bool {
+	limit := m.getFormat().MaxSnapshots
+	return parent == SnapshotInode && limit > 0 && int(nlink)-2 >= limit
+}
+
 func cloneFlags(flags, cmode uint8) uint8 {
 	if cmode&CLONE_MODE_SNAPSHOT != 0 {
 		return flags | FlagSnapshot | FlagImmutable

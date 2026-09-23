@@ -5387,6 +5387,38 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 	if s, i := usage(); s != space || i != inodes {
 		t.Fatalf("reaping a snapshot credited usage: space %d -> %d, inodes %d -> %d", space, s, inodes, i)
 	}
+
+	// a volume can cap its snapshot count, and deleting one makes room again
+	snaps, st := m.ListSnapshots(ctx)
+	if st != 0 {
+		t.Fatalf("list snapshots: %s", st)
+	}
+	format := *base.getFormat()
+	limited := format
+	limited.MaxSnapshots = len(snaps) + 1
+	base.setFormat(&limited)
+	defer base.setFormat(&format)
+	if _, st := m.CreateSnapshot(ctx, dir, "cap1", nil, nil); st != 0 {
+		t.Fatalf("create snapshot below the limit: %s", st)
+	}
+	if _, st := m.CreateSnapshot(ctx, dir, "cap2", nil, nil); st != syscall.EDQUOT {
+		t.Fatalf("a snapshot over the limit should be EDQUOT, got %s", st)
+	}
+	if st := m.DeleteSnapshot(ctx, "cap1", nil); st != 0 {
+		t.Fatalf("delete snapshot: %s", st)
+	}
+	if _, st := m.CreateSnapshot(ctx, dir, "cap2", nil, nil); st != 0 {
+		t.Fatalf("create snapshot after making room: %s", st)
+	}
+	// a create that passed the early check alongside another one is still
+	// refused when it attaches, so concurrent creates cannot overshoot
+	var late Ino
+	if st := m.Mkdir(ctx, RootInode, "capLate", 0755, 022, 0, &late, &attr); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := base.en.doAttachDirNode(ctx, SnapshotInode, late, "cap3"); st != syscall.EDQUOT {
+		t.Fatalf("attaching a snapshot over the limit should be EDQUOT, got %s", st)
+	}
 }
 
 func testQuota(t *testing.T, m Meta) {

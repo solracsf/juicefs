@@ -4905,6 +4905,9 @@ func (m *kvMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string
 		if (pattr.Flags & FlagImmutable) != 0 {
 			return syscall.EPERM
 		}
+		if m.snapshotLimitReached(parent, pattr.Nlink) {
+			return syscall.EDQUOT
+		}
 		if tx.get(m.entryKey(parent, name)) != nil {
 			return syscall.EEXIST
 		}
