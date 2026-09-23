@@ -129,6 +129,11 @@ jobs:
         run: |
           sudo META=${{matrix.meta}} .github/scripts/command/clone.sh
 
+      - name: Test Snapshot
+        timeout-minutes: 30
+        run: |
+          sudo META=${{matrix.meta}} .github/scripts/command/snapshot.sh
+
       - name: Test fsck
         timeout-minutes: 10
         run: |
