@@ -361,6 +361,62 @@ func TestVFSIO(t *testing.T) {
 	v.Release(ctx, fe.Inode, fh)
 }
 
+// A snapshot root sits above minInternalNode but is a real directory, so it must
+// be served by the metadata engine rather than treated as an internal file.
+func TestVFSSnapshotRoot(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fe, e := v.Mkdir(ctx, 1, "snapsrc", 0755, 0)
+	if e != 0 {
+		t.Fatalf("mkdir: %s", e)
+	}
+	if e := v.SetXattr(ctx, fe.Inode, "user.k", []byte("v"), 0); e != 0 {
+		t.Fatalf("setxattr: %s", e)
+	}
+	listed := func() bool {
+		fh, _ := v.Opendir(ctx, 1, 0)
+		defer v.Releasedir(ctx, 1, fh)
+		entries, _, e := v.Readdir(ctx, 1, 1024, 0, fh, true)
+		if e != 0 {
+			t.Fatalf("readdir root: %s", e)
+		}
+		for _, entry := range entries {
+			if string(entry.Name) == meta.SnapshotName {
+				return true
+			}
+		}
+		return false
+	}
+	if listed() {
+		t.Fatalf("%s is listed before any snapshot exists", meta.SnapshotName)
+	}
+	root, st := v.Meta.CreateSnapshot(meta.Background(), fe.Inode, "s", nil, nil)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	if IsSpecialNode(root) {
+		t.Fatalf("snapshot root %d is treated as an internal node", root)
+	}
+	if val, e := v.GetXattr(ctx, root, "user.k", 16); e != 0 || string(val) != "v" {
+		t.Fatalf("getxattr on the snapshot root: %q %s", val, e)
+	}
+	if e := v.SetXattr(ctx, root, "user.k", []byte("w"), 0); e != syscall.EPERM {
+		t.Fatalf("setxattr on the snapshot root should be EPERM, got %s", e)
+	}
+
+	// listed in the root like .trash, and hidden with it
+	if !listed() {
+		t.Fatalf("%s is not listed in the root once a snapshot exists", meta.SnapshotName)
+	}
+	if e, err := v.Lookup(ctx, 1, meta.SnapshotName); err != 0 || e.Inode != meta.SnapshotInode {
+		t.Fatalf("lookup %s: %v %s", meta.SnapshotName, e, err)
+	}
+	v.Conf.HideInternal = true
+	if listed() {
+		t.Fatalf("%s is listed although HideInternal is set", meta.SnapshotName)
+	}
+}
+
 func TestVFSXattrs(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ctx := NewLogContext(meta.Background())

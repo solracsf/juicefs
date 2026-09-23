@@ -105,8 +105,10 @@ func init() {
 	}
 }
 
+// IsSpecialNode reports whether ino is served by the VFS itself. Snapshot roots
+// share the high range but are real directories in the metadata engine.
 func IsSpecialNode(ino Ino) bool {
-	return ino >= minInternalNode
+	return ino >= minInternalNode && !ino.IsSnapshot()
 }
 
 func IsSpecialName(name string) bool {
