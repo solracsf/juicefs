@@ -4935,6 +4935,12 @@ func testSnapshot(t *testing.T, m Meta) {
 	if st := m.Write(ctx, file, 0, 0, Slice{Id: 200001, Size: 100, Len: 100}, time.Now()); st != 0 {
 		t.Fatalf("write f: %s", st)
 	}
+	// an old atime, so that reading the snapshot copy would refresh it
+	for _, ino := range []Ino{sub, file} {
+		if st := m.SetAttr(ctx, ino, SetAttrAtime, 0, &Attr{Atime: 1}); st != 0 {
+			t.Fatalf("set atime of %d: %s", ino, st)
+		}
+	}
 
 	var totalSpace, availSpace, iused, iavail uint64
 	m.getBase().doFlushStats()
@@ -5035,6 +5041,27 @@ func testSnapshot(t *testing.T, m Meta) {
 	}
 	if st := m.SetAttr(ctx, snapFile, SetAttrMode, 0, &Attr{Mode: attr.Mode}); st != 0 {
 		t.Fatalf("a no-op chmod on a snapshot file should be allowed, got %s", st)
+	}
+	// reading a snapshot leaves its atime alone
+	mode := m.getBase().conf.AtimeMode
+	m.getBase().conf.AtimeMode = RelAtime
+	if st := m.Open(ctx, snapFile, syscall.O_RDONLY, &Attr{}); st != 0 {
+		t.Fatalf("open snapshot file: %s", st)
+	}
+	var slices []Slice
+	if st := m.Read(ctx, snapFile, 0, &slices); st != 0 {
+		t.Fatalf("read snapshot file: %s", st)
+	}
+	m.Close(ctx, snapFile)
+	var entries []*Entry
+	if st := m.Readdir(ctx, snapSub, 0, &entries); st != 0 {
+		t.Fatalf("readdir snapshot dir: %s", st)
+	}
+	m.getBase().conf.AtimeMode = mode
+	for _, ino := range []Ino{snapFile, snapSub} {
+		if st := m.GetAttr(ctx, ino, &attr); st != 0 || attr.Atime != 1 {
+			t.Fatalf("reading snapshot inode %d changed its atime to %d (%s)", ino, attr.Atime, st)
+		}
 	}
 
 	// the data is shared, so the slice must still be referenced after the
