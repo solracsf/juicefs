@@ -29,6 +29,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -5522,7 +5523,7 @@ func testSnapshotHolds(t *testing.T, m Meta) {
 	}
 	restarts := txRestarts(m) + txRestarts(peer)
 	var holdsWon, deletesWon int
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		name := fmt.Sprintf("race%d", i)
 		if _, st := m.CreateSnapshot(ctx, dir, name, false, nil, nil); st != 0 {
 			t.Fatalf("create %s: %s", name, st)
@@ -5533,14 +5534,12 @@ func testSnapshotHolds(t *testing.T, m Meta) {
 		}
 		var hold, del syscall.Errno
 		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// the delete looks the snapshot up first: spread where the hold lands
 			time.Sleep(time.Duration(i%8) * 250 * time.Microsecond)
 			hold = holder.HoldSnapshot(ctx, name, "racer")
-		}()
-		go func() { defer wg.Done(); del = deleter.DeleteSnapshot(ctx, name, nil) }()
+		})
+		wg.Go(func() { del = deleter.DeleteSnapshot(ctx, name, nil) })
 		wg.Wait()
 		switch {
 		case hold == 0 && del == syscall.EBUSY:
@@ -5622,14 +5621,14 @@ func testSnapshotCompact(t *testing.T, m Meta) {
 
 	var l sync.Mutex
 	deleted := make(map[uint64]bool)
-	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+	m.OnMsg(DeleteSlice, func(args ...any) error {
 		l.Lock()
 		deleted[args[0].(uint64)] = true
 		l.Unlock()
 		return nil
 	})
-	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
-	defer m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+	m.OnMsg(CompactChunk, func(args ...any) error { return nil })
+	defer m.OnMsg(DeleteSlice, func(args ...any) error { return nil })
 
 	ctx := Background()
 	var dir, file Ino
@@ -5648,7 +5647,7 @@ func testSnapshotCompact(t *testing.T, m Meta) {
 			t.Fatalf("write at %d: %s", off, st)
 		}
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		write(uint32(i) * 1000)
 	}
 
@@ -5772,12 +5771,12 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 	space, inodes := usage()
 	// hold every data-deletion slot for a moment: a delete that gave up on a busy
 	// slot would leave the snapshot's data to some later gc run
-	for i := 0; i < cap(base.maxDeleting); i++ {
+	for range cap(base.maxDeleting) {
 		base.maxDeleting <- struct{}{}
 	}
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		for i := 0; i < cap(base.maxDeleting); i++ {
+		for range cap(base.maxDeleting) {
 			<-base.maxDeleting
 		}
 	}()
@@ -5839,12 +5838,7 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 		t.Fatalf("detach: %s", st)
 	}
 	reapable := func(ino Ino, edge time.Time) bool {
-		for _, n := range base.en.doFindDetachedNodes(edge) {
-			if n == ino {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(base.en.doFindDetachedNodes(edge), ino)
 	}
 	if !reapable(root2, time.Now().Add(-24*time.Hour)) {
 		t.Fatalf("a detached snapshot root should be reapable at once")

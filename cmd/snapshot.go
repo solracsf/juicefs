@@ -153,13 +153,15 @@ func snapshotCreate(c *cli.Context) error {
 	var count, total uint64
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-time.After(time.Millisecond * 200):
-				bar.SetTotal(int64(total))
-				bar.SetCurrent(int64(count))
+			case <-ticker.C:
+				bar.SetTotal(int64(atomic.LoadUint64(&total)))
+				bar.SetCurrent(int64(atomic.LoadUint64(&count)))
 			}
 		}
 	}()
@@ -241,7 +243,7 @@ func snapshotDelete(c *cli.Context) error {
 	chunkConf := *getDefaultChunkConf(format)
 	chunkConf.CacheDir = "memory"
 	store := chunk.NewCachedStore(blob, chunkConf, nil)
-	m.OnMsg(meta.DeleteSlice, func(args ...interface{}) error {
+	m.OnMsg(meta.DeleteSlice, func(args ...any) error {
 		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
 	})
 
@@ -250,11 +252,13 @@ func snapshotDelete(c *cli.Context) error {
 	var count uint64
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-time.After(time.Millisecond * 200):
+			case <-ticker.C:
 				spin.SetCurrent(int64(atomic.LoadUint64(&count)))
 			}
 		}

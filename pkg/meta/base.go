@@ -28,6 +28,7 @@ import (
 	"path"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3625,10 +3626,10 @@ func (m *baseMeta) DeleteSnapshot(ctx Context, name string, count *uint64) sysca
 	}
 	// file data is removed in the background; wait for it, so the slices this
 	// snapshot alone held are gone when it returns
-	for i := 0; i < cap(m.maxDeleting); i++ {
+	for range cap(m.maxDeleting) {
 		m.maxDeleting <- struct{}{}
 	}
-	for i := 0; i < cap(m.maxDeleting); i++ {
+	for range cap(m.maxDeleting) {
 		<-m.maxDeleting
 	}
 	return 0
@@ -3649,7 +3650,7 @@ func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
 		snaps = append(snaps, &SnapshotInfo{Inode: e.Inode, Name: string(e.Name),
 			Created: time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec)), Holds: holds})
 	}
-	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Name < snaps[j].Name })
+	slices.SortFunc(snaps, func(a, b *SnapshotInfo) int { return strings.Compare(a.Name, b.Name) })
 	return snaps, 0
 }
 
@@ -3688,7 +3689,7 @@ func (m *baseMeta) snapshotHolds(ctx Context, root Ino) ([]string, syscall.Errno
 			tags = append(tags, k[len(snapshotHoldPrefix):])
 		}
 	}
-	sort.Strings(tags)
+	slices.Sort(tags)
 	return tags, 0
 }
 
