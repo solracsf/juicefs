@@ -5129,8 +5129,6 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 				counters.NextSession = row.Value
 			case "nextTrash":
 				counters.NextTrash = row.Value
-			case "nextSnapshot":
-				counters.NextSnapshot = row.Value
 			}
 		}
 		counters.LastChangelog = lastChangelog
@@ -5539,10 +5537,7 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, attr); eno != 0 {
 			return eno
 		}
-		n.Flags = clearSnapshotFlags(n.Flags)
-		if cmode&CLONE_MODE_SNAPSHOT != 0 {
-			n.Flags |= FlagSnapshot | FlagImmutable
-		}
+		n.Flags = cloneFlags(n.Flags, cmode)
 		attr.Flags = n.Flags
 
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
@@ -5732,10 +5727,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			if sn.Type == TypeFile && sn.Nlink > 1 {
 				info.dstNode.Nlink = 1
 			}
-			info.dstNode.Flags = clearSnapshotFlags(info.dstNode.Flags)
-			if cmode&CLONE_MODE_SNAPSHOT != 0 {
-				info.dstNode.Flags |= FlagSnapshot | FlagImmutable
-			}
+			info.dstNode.Flags = cloneFlags(info.dstNode.Flags, cmode)
 
 			nodesIns = append(nodesIns, &info.dstNode)
 			edgesIns = append(edgesIns, &edge{

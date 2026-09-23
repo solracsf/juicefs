@@ -4154,8 +4154,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 			m.counterKey("nextInode"),
 			m.counterKey("nextChunk"),
 			m.counterKey("nextSession"),
-			m.counterKey("nextTrash"),
-			m.counterKey("nextSnapshot"))
+			m.counterKey("nextTrash"))
 		return nil
 	})
 	if err != nil {
@@ -4239,7 +4238,6 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 			NextChunk:     cs[3],
 			NextSession:   cs[4],
 			NextTrash:     cs[5],
-			NextSnapshot:  cs[6],
 			LastChangelog: lastChangelog,
 		},
 		Sustained:   sessions,
@@ -4506,10 +4504,7 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			return eno
 		}
 		attr.Parent = parent
-		attr.Flags = clearSnapshotFlags(attr.Flags)
-		if cmode&CLONE_MODE_SNAPSHOT != 0 {
-			attr.Flags |= FlagSnapshot | FlagImmutable
-		}
+		attr.Flags = cloneFlags(attr.Flags, cmode)
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()
@@ -4742,10 +4737,7 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			if attr.Typ == TypeFile && attr.Nlink > 1 {
 				attr.Nlink = 1
 			}
-			attr.Flags = clearSnapshotFlags(attr.Flags)
-			if cmode&CLONE_MODE_SNAPSHOT != 0 {
-				attr.Flags |= FlagSnapshot | FlagImmutable
-			}
+			attr.Flags = cloneFlags(attr.Flags, cmode)
 
 			// check entry does not exist
 			if tx.get(m.entryKey(dstParent, info.name)) != nil {

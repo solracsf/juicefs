@@ -5001,7 +5001,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 		dels = append(dels, &DumpedDelFile{Ino(inode), length, int64(z.Score)})
 	}
 
-	names := []string{usedSpace, totalInodes, "nextinode", "nextchunk", "nextsession", "nextTrash", "nextSnapshot"}
+	names := []string{usedSpace, totalInodes, "nextinode", "nextchunk", "nextsession", "nextTrash"}
 	for i := range names {
 		names[i] = m.prefix + names[i]
 	}
@@ -5051,7 +5051,6 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 			NextChunk:     cs[3] + 1,
 			NextSession:   cs[4],
 			NextTrash:     cs[5],
-			NextSnapshot:  cs[6],
 			LastChangelog: lastChangelog,
 		},
 		Sustained:   sessions,
@@ -5384,10 +5383,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			return eno
 		}
 		attr.Parent = parent
-		attr.Flags = clearSnapshotFlags(attr.Flags)
-		if cmode&CLONE_MODE_SNAPSHOT != 0 {
-			attr.Flags |= FlagSnapshot | FlagImmutable
-		}
+		attr.Flags = cloneFlags(attr.Flags, cmode)
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			attr.Uid = ctx.Uid()
@@ -5747,10 +5743,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				if info.dstAttr.Typ == TypeFile && info.dstAttr.Nlink > 1 {
 					info.dstAttr.Nlink = 1
 				}
-				info.dstAttr.Flags = clearSnapshotFlags(info.dstAttr.Flags)
-				if cmode&CLONE_MODE_SNAPSHOT != 0 {
-					info.dstAttr.Flags |= FlagSnapshot | FlagImmutable
-				}
+				info.dstAttr.Flags = cloneFlags(info.dstAttr.Flags, cmode)
 				info.xattr = sd.xattr
 				if info.dstAttr.Typ == TypeFile {
 					batchResult.length += int64(sd.attr.Length)

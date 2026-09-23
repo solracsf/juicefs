@@ -153,8 +153,6 @@ var SnapshotName = ".snapshots"
 
 // MinSnapshotVersion is the first client version that understands snapshots. It
 // names the dev pre-release so builds from the 1.5.0 line are accepted too.
-// A snapshot is refused while an older client still holds a session, since the
-// format gate at mount cannot reach one that is already running.
 const MinSnapshotVersion = "1.5.0-dev"
 
 // isReservedEntry reports whether name is one of the hidden roots under the volume

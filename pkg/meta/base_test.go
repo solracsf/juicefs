@@ -4985,18 +4985,36 @@ func testSnapshot(t *testing.T, m Meta) {
 	if st := m.Unlink(ctx, snapSub, "f"); st != syscall.EPERM {
 		t.Fatalf("unlinking inside a snapshot should be EPERM, got %s", st)
 	}
+	// and no attribute or xattr change either, at any depth
+	for _, ino := range []Ino{snapFile, snapSub} {
+		for name, change := range map[string]func() syscall.Errno{
+			"chmod":       func() syscall.Errno { return m.SetAttr(ctx, ino, SetAttrMode, 0, &Attr{Mode: 0777}) },
+			"chown":       func() syscall.Errno { return m.SetAttr(ctx, ino, SetAttrUID, 0, &Attr{Uid: 1234}) },
+			"utimes":      func() syscall.Errno { return m.SetAttr(ctx, ino, SetAttrMtime, 0, &Attr{Mtime: 1}) },
+			"setxattr":    func() syscall.Errno { return m.SetXattr(ctx, ino, "user.k", []byte("v"), 0) },
+			"removexattr": func() syscall.Errno { return m.RemoveXattr(ctx, ino, "user.k") },
+		} {
+			if st := change(); st != syscall.EPERM {
+				t.Fatalf("%s on snapshot inode %d should be EPERM, got %s", name, ino, st)
+			}
+		}
+	}
+	if st := m.GetAttr(ctx, snapFile, &attr); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	if st := m.SetAttr(ctx, snapFile, SetAttrMode, 0, &Attr{Mode: attr.Mode}); st != 0 {
+		t.Fatalf("a no-op chmod on a snapshot file should be allowed, got %s", st)
+	}
 
 	// the data is shared, so the slice must still be referenced after the
 	// original is deleted: this is what keeps gc from freeing the blocks
 	if st := m.Unlink(ctx, sub, "f"); st != 0 {
 		t.Fatalf("unlink original: %s", st)
 	}
-	var refs int
 	found := false
 	if st := m.ScanSlices(ctx, &ScanSlicesOption{}, func(ino Ino, s Slice) error {
 		if s.Id == 200001 {
 			found = true
-			refs++
 		}
 		return nil
 	}); st != 0 {

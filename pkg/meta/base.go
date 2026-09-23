@@ -2347,7 +2347,11 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 
 	defer m.timeit("SetXattr", time.Now())
-	return m.en.doSetXattr(ctx, m.checkRoot(inode), name, value, flags)
+	inode = m.checkRoot(inode)
+	if st := m.checkNotSnapshot(ctx, inode); st != 0 {
+		return st
+	}
+	return m.en.doSetXattr(ctx, inode, name, value, flags)
 }
 
 func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
@@ -2359,7 +2363,23 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	}
 
 	defer m.timeit("RemoveXattr", time.Now())
-	return m.en.doRemoveXattr(ctx, m.checkRoot(inode), name)
+	inode = m.checkRoot(inode)
+	if st := m.checkNotSnapshot(ctx, inode); st != 0 {
+		return st
+	}
+	return m.en.doRemoveXattr(ctx, inode, name)
+}
+
+// checkNotSnapshot refuses changes to an inode frozen by a snapshot.
+func (m *baseMeta) checkNotSnapshot(ctx Context, inode Ino) syscall.Errno {
+	var attr Attr
+	if st := m.en.doGetAttr(ctx, inode, &attr); st != 0 {
+		return st
+	}
+	if attr.Flags&FlagSnapshot != 0 {
+		return syscall.EPERM
+	}
+	return 0
 }
 
 func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
@@ -2914,10 +2934,8 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		}
 	}
 
-	// a snapshot is frozen: merging its slices would rewrite what it captured,
-	// and write to object storage on behalf of read-only data. Checked here, after
-	// the cheap structural tests above, so it costs a read only when compaction
-	// would otherwise go ahead
+	// a snapshot is frozen, so merging its slices would rewrite what it captured;
+	// checked after the cheap tests above so it costs a read only when needed
 	var cattr Attr
 	if eno := m.en.doGetAttr(Background(), inode, &cattr); eno == 0 && cattr.Flags&FlagSnapshot != 0 {
 		return
@@ -3106,12 +3124,9 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 		Ctime:  now.Unix(),
 		Full:   true,
 	}
-	// doRepair is an upsert, so two clients racing here both write the same
-	// directory and the later one only refreshes its timestamps. The volume
-	// counters are deliberately not touched: the trash root is not counted
-	// either, and no recount pass walks a root that has no entry to reach it.
-	// recount nlink from the edges rather than trusting the attr, so a racing
-	// creator that already attached snapshots is not clobbered back to 2
+	// doRepair is an upsert, so racing creators are harmless, and it recounts
+	// nlink from the edges instead of resetting it to 2. Like the trash root, this
+	// one is not counted in the volume usage.
 	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
 }
 
@@ -3189,11 +3204,11 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 		return 0, st
 	}
 
-	var sum Summary
-	if st := m.GetSummary(ctx, src, &sum, true, false); st != 0 {
-		return 0, st
-	}
 	if total != nil {
+		var sum Summary
+		if st := m.GetSummary(ctx, src, &sum, true, false); st != 0 {
+			return 0, st
+		}
 		*total = sum.Dirs + sum.Files
 	}
 
@@ -3202,10 +3217,6 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 		return 0, errno(err)
 	}
 	root := SnapshotInode + Ino(next)
-	if !root.IsSnapshot() {
-		logger.Errorf("snapshot counter %d is out of range", next)
-		return 0, syscall.ENOSPC
-	}
 
 	if count == nil {
 		count = new(uint64)
@@ -3230,34 +3241,26 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 
 // ListSnapshots returns the snapshots under the hidden root, by name.
 func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
-	if st := m.en.doGetAttr(ctx, SnapshotInode, nil); st == syscall.ENOENT {
-		return nil, 0 // no snapshot has ever been taken
-	} else if st != 0 {
-		return nil, st
-	}
 	var entries []*Entry
 	if st := m.en.doReaddir(ctx, SnapshotInode, 1, &entries, -1); st != 0 && st != syscall.ENOENT {
 		return nil, st
 	}
 	snaps := make([]*SnapshotInfo, 0, len(entries))
 	for _, e := range entries {
-		if n := string(e.Name); n == "." || n == ".." {
-			continue
-		}
-		info := &SnapshotInfo{Inode: e.Inode, Name: string(e.Name)}
-		if e.Attr != nil {
-			info.Created = time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec))
-		}
-		snaps = append(snaps, info)
+		snaps = append(snaps, &SnapshotInfo{Inode: e.Inode, Name: string(e.Name),
+			Created: time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec))})
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Name < snaps[j].Name })
 	return snaps, 0
 }
 
-// clearSnapshotFlags returns the flags a copy of a snapshot inode should carry.
-// The freeze belongs to the snapshot, so a copy leaving it must not inherit it,
-// or its flags could never be changed again by anyone.
-func clearSnapshotFlags(flags uint8) uint8 {
+// cloneFlags returns the flags a cloned inode carries. A snapshot freezes its
+// copies; a copy leaving a snapshot drops the freeze, or its flags could never
+// be changed again by anyone.
+func cloneFlags(flags, cmode uint8) uint8 {
+	if cmode&CLONE_MODE_SNAPSHOT != 0 {
+		return flags | FlagSnapshot | FlagImmutable
+	}
 	if flags&FlagSnapshot != 0 {
 		return flags &^ (FlagSnapshot | FlagImmutable)
 	}
@@ -3896,17 +3899,17 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	if set&SetAttrFlag != 0 {
-		// a snapshot is frozen for everyone, root included: allowing its flags to
-		// change would let FlagImmutable be cleared and the snapshot rewritten
-		if cur.Flags&FlagSnapshot != 0 && attr.Flags != cur.Flags {
-			return nil, syscall.EPERM
-		}
 		dirtyAttr.Flags = attr.Flags
 		changed = true
 	}
 	if set&SetAttrTier != 0 {
 		dirtyAttr.Tier = attr.Tier
 		changed = true
+	}
+	// a snapshot is frozen for everyone, root included. FlagImmutable alone does
+	// not refuse attribute changes, and clearing it would let the data be rewritten
+	if cur.Flags&FlagSnapshot != 0 && dirtyAttr != *cur {
+		return nil, syscall.EPERM
 	}
 	if !changed {
 		*attr = *cur
