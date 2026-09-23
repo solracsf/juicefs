@@ -198,6 +198,7 @@ juicefs format sqlite3://myjfs.db myjfs --trash-days=0
 |-|-|
 |`--capacity=0`|storage space limit in GiB, default to 0 which means no limit. Capacity will include trash files, if [trash](../security/trash.md) is enabled.|
 |`--inodes=0`|Limit the number of inodes, default to 0 which means no limit.|
+|`--max-snapshots=0` <VersionAdd>1.5</VersionAdd> |Limit the number of [snapshots](../guide/snapshot.md) the volume may hold, default to 0 which means no limit.|
 |`--trash-days=1`|By default, delete files are put into [trash](../security/trash.md), this option controls the number of days before trash files are expired, default to 1, set to 0 to disable trash.|
 |`--enable-acl=true` <VersionAdd>1.2</VersionAdd>|enable [POSIX ACL](../security/posix_acl.md)，it is irreversible. |
 
@@ -252,6 +253,7 @@ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version
 |-|-|
 |`--capacity value`|limit for space in GiB|
 |`--inodes value`|limit for number of inodes|
+|`--max-snapshots value` <VersionAdd>1.5</VersionAdd> |limit for number of [snapshots](../guide/snapshot.md), 0 means no limit|
 |`--trash-days value`|number of days after which removed files will be permanently deleted|
 |`--enable-acl` <VersionAdd>1.2</VersionAdd>|enable [POSIX ACL](../security/posix_acl.md) (irreversible), at the same time, the minimum client version allowed to connect will be upgraded to v1.2|
 |`--encrypt-secret`|encrypt the secret key if it was previously stored in plain format (default: false)|
@@ -1084,6 +1086,42 @@ juicefs clone -p /mnt/jfs/file1 /mnt/jfs/file2
 |Items|Description|
 |-|-|
 |`--preserve, -p`|By default, the executor's UID and GID are used for the clone result, and the mode is recalculated based on the user's umask. Use this option to preserve the UID, GID, and mode of the file.|
+
+### `juicefs snapshot` <VersionAdd>1.5</VersionAdd> {#snapshot}
+
+Create, list, hold and delete read-only snapshots of directories. A snapshot copies metadata only and is kept under `/.snapshots`. Read [Snapshots](../guide/snapshot.md) for more.
+
+#### Synopsis
+
+```shell
+juicefs snapshot create [command options] META-URL
+juicefs snapshot list META-URL
+juicefs snapshot delete [command options] META-URL
+juicefs snapshot hold [command options] META-URL
+juicefs snapshot release [command options] META-URL
+
+# Snapshot a directory
+juicefs snapshot create redis://localhost --path /data --name before-upgrade
+
+# List snapshots with the inodes and size each one holds
+juicefs snapshot list redis://localhost
+
+# Delete a snapshot and release the data only it referenced
+juicefs snapshot delete redis://localhost --name before-upgrade
+
+# Keep a snapshot from being deleted while a backup reads it, then let it go
+juicefs snapshot hold redis://localhost --name before-upgrade --tag backup-123
+juicefs snapshot release redis://localhost --name before-upgrade --tag backup-123
+```
+
+#### Options
+
+|Items|Description|
+|-|-|
+|`--path value`|directory to snapshot, relative to the root of the volume (default: `/`); it cannot be in a snapshot, used by `create`|
+|`--name value`|name of the snapshot, used by `create`, `delete`, `hold` and `release`|
+|`--tag value`|name of the hold, used by `hold` and `release`: 1 to 200 bytes of UTF-8 without control characters|
+|`--best-effort`|keep the copy even if the tree changes while it is taken, so it may not be a point-in-time image (default: false), used by `create`|
 
 ### `juicefs compact` <VersionAdd>1.2</VersionAdd> {#compact}
 
