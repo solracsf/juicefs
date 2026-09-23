@@ -938,6 +938,10 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if st := src.Write(ctx, file, 0, 0, Slice{Id: 300001, Size: 100, Len: 100}, time.Now()); st != 0 {
 					t.Fatalf("write f: %s", st)
 				}
+				// a second name, so the snapshot holds a hard-linked copy
+				if st := src.Link(ctx, file, dir, "g", &Attr{}); st != 0 {
+					t.Fatalf("link g: %s", st)
+				}
 				snap, st := src.CreateSnapshot(ctx, dir, "s1", false, nil, nil)
 				if st != 0 {
 					t.Fatalf("create snapshot: %s", st)
@@ -996,8 +1000,12 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if st := dst.Lookup(ctx, snapSub, "f", &snapFile, &attr, false); st != 0 {
 					t.Fatalf("lookup f in snapshot: %s", st)
 				}
-				if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable || attr.Length != 100 {
-					t.Fatalf("snapshot file after load: flags %d length %d", attr.Flags, attr.Length)
+				if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable || attr.Length != 100 || attr.Nlink != 2 {
+					t.Fatalf("snapshot file after load: flags %d length %d nlink %d", attr.Flags, attr.Length, attr.Nlink)
+				}
+				var linked Ino
+				if st := dst.Lookup(ctx, snap, "g", &linked, &attr, false); st != 0 || linked != snapFile {
+					t.Fatalf("hard link in snapshot after load: %d %s, want %d", linked, st, snapFile)
 				}
 				if same, st := dst.getBase().snapshotMatches(ctx, dir, snap); st != 0 || !same {
 					t.Fatalf("snapshot no longer matches its source after load: %v %s", same, st)

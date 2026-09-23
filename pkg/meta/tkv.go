@@ -3440,6 +3440,30 @@ func (m *kvMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) sy
 	return 0
 }
 
+func (m *kvMeta) doSnapshotLink(ctx Context, inode, parent Ino, name string) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		rs := tx.gets(m.inodeKey(inode), m.entryKey(parent, name))
+		if rs[0] == nil {
+			return syscall.ENOENT
+		}
+		if rs[1] != nil {
+			return syscall.EEXIST
+		}
+		var attr Attr
+		m.parseAttr(rs[0], &attr)
+		oldParent := attr.Parent
+		attr.Parent = 0
+		attr.Nlink++
+		tx.set(m.entryKey(parent, name), m.packEntry(attr.Typ, inode))
+		tx.set(m.inodeKey(inode), m.marshal(&attr))
+		if oldParent > 0 {
+			tx.incrBy(m.parentKey(inode, oldParent), 1)
+		}
+		tx.incrBy(m.parentKey(inode, parent), 1)
+		return nil
+	}, inode))
+}
+
 func (m *kvMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno) {
 	prefix := m.xattrKey(inode, "")
 	vals, err := m.scanValues(ctx, prefix, -1, nil)

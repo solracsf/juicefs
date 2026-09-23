@@ -4349,6 +4349,33 @@ func (m *redisMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, sysc
 	return xs, 0
 }
 
+func (m *redisMeta) doSnapshotLink(ctx Context, inode, parent Ino, name string) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		if tx.HExists(ctx, m.entryKey(parent), name).Val() {
+			return syscall.EEXIST
+		}
+		var attr Attr
+		m.parseAttr(a, &attr)
+		oldParent := attr.Parent
+		attr.Parent = 0
+		attr.Nlink++
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, m.entryKey(parent), name, m.packEntry(attr.Typ, inode))
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&attr), 0)
+			if oldParent > 0 {
+				pipe.HIncrBy(ctx, m.parentKey(inode), oldParent.String(), 1)
+			}
+			pipe.HIncrBy(ctx, m.parentKey(inode), parent.String(), 1)
+			return nil
+		})
+		return err
+	}, m.inodeKey(inode), m.entryKey(parent)))
+}
+
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
 	inodeKey := m.inodeKey(inode)
 	xattrKey := m.xattrKey(inode)

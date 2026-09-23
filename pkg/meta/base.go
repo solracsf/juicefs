@@ -136,6 +136,9 @@ type engine interface {
 	doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno
 	// doGetXattrs returns every extended attribute of inode, by name
 	doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno)
+	// doSnapshotLink adds parent/name as another link to inode, a file already
+	// copied into a snapshot under construction; flags and times are left alone
+	doSnapshotLink(ctx Context, inode, parent Ino, name string) syscall.Errno
 	doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno
 	doTouchAtime(ctx Context, inode Ino, attr *Attr, ts time.Time) (bool, error)
 	doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno)
@@ -3411,7 +3414,9 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 	}()
 	cmode := uint8(CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_SNAPSHOT)
 	dst := root
-	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
+	links := &snapshotLinks{copies: make(map[Ino]*snapshotCopy)}
+	st := m.cloneEntry(ctx.WithValue(snapshotLinksKey{}, links), src, SnapshotInode, name, &dst, cmode, 0, count, true,
+		make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
 	if st == 0 && consistent {
 		var same bool
 		if same, st = m.snapshotMatches(ctx, src, root); st == 0 && !same {
@@ -4078,6 +4083,7 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 	cloneCtx := WrapWithCancel(ctx, ctx.Pid(), ctx.Uid(), ctx.Gids())
 	defer cloneCtx.Cancel()
+	links, _ := ctx.Value(snapshotLinksKey{}).(*snapshotLinks)
 
 	var g errgroup.Group
 	nlink := uint32(2)
@@ -4107,7 +4113,7 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			break
 		}
 
-		var nonDirEntries []*Entry
+		var nonDirEntries, linked []*Entry
 		for _, e := range batchEntries {
 			if string(e.Name) == "." || string(e.Name) == ".." {
 				continue
@@ -4130,6 +4136,8 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 						eno = childEno
 					}
 				}
+			} else if links != nil && e.Attr.Nlink > 1 {
+				linked = append(linked, e)
 			} else {
 				nonDirEntries = append(nonDirEntries, e)
 			}
@@ -4149,6 +4157,14 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			if eno != 0 {
 				break
 			}
+		}
+		for _, e := range linked {
+			if eno = m.cloneLinked(cloneCtx, links, e, ino, cmode, cumask, count); eno != 0 {
+				break
+			}
+		}
+		if eno != 0 {
+			break
 		}
 
 		offset += len(batchEntries)
@@ -4179,6 +4195,50 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		}
 	}
 	return eno
+}
+
+type snapshotLinksKey struct{}
+
+// snapshotLinks maps each hard-linked file of a tree being snapshotted to its
+// copy, so every name of the file in the tree ends up as a link to one copy.
+type snapshotLinks struct {
+	sync.Mutex
+	copies map[Ino]*snapshotCopy
+}
+
+type snapshotCopy struct {
+	done chan struct{}
+	ino  Ino
+	st   syscall.Errno
+}
+
+// cloneLinked copies e, a file with several links, the first time the snapshot
+// meets it, and links the copy under every other name it has in the tree.
+func (m *baseMeta) cloneLinked(ctx Context, links *snapshotLinks, e *Entry, parent Ino, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
+	links.Lock()
+	c, seen := links.copies[e.Inode]
+	if !seen {
+		c = &snapshotCopy{done: make(chan struct{})}
+		links.copies[e.Inode] = c
+	}
+	links.Unlock()
+	if !seen {
+		c.st = m.cloneEntry(ctx, e.Inode, parent, string(e.Name), &c.ino, cmode, cumask, count, false, nil)
+		close(c.done)
+	} else {
+		<-c.done
+		if c.st == 0 {
+			if st := m.en.doSnapshotLink(ctx, c.ino, parent, string(e.Name)); st != 0 {
+				return st
+			}
+			atomic.AddUint64(count, 1)
+		}
+	}
+	if c.st == syscall.ENOENT {
+		logger.Warnf("ignore deleted %s in dir %d", string(e.Name), parent)
+		return 0
+	}
+	return c.st
 }
 
 func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr, now time.Time, rule *aclAPI.Rule) (*Attr, syscall.Errno) {

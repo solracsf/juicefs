@@ -4332,6 +4332,29 @@ func (m *dbMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) sy
 	}))
 }
 
+func (m *dbMeta) doSnapshotLink(ctx Context, inode, parent Ino, name string) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		var n = node{Inode: inode}
+		ok, err := s.ForUpdate().Get(&n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return syscall.ENOENT
+		}
+		n.Parent = 0
+		n.Nlink++
+		if err = mustInsert(s, &edge{Parent: parent, Name: []byte(name), Inode: inode, Type: n.Type}); err != nil {
+			if isDuplicateEntryErr(err) {
+				return syscall.EEXIST
+			}
+			return err
+		}
+		_, err = s.Cols("nlink", "parent").Update(&n, &node{Inode: inode})
+		return err
+	}, inode))
+}
+
 func (m *dbMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno) {
 	var xs map[string][]byte
 	err := m.roTxn(ctx, func(s *xorm.Session) error {

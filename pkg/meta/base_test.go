@@ -192,6 +192,7 @@ func testMeta(t *testing.T, m Meta) {
 	testSnapshotRoot(t, m)
 	testSnapshot(t, m)
 	testSnapshotConsistency(t, m)
+	testSnapshotHardlinks(t, m)
 	testSnapshotLeakedInodes(t, m)
 	testSnapshotCompact(t, m)
 	testSnapshotDelete(t, m)
@@ -5244,6 +5245,72 @@ func testSnapshotConsistency(t *testing.T, m Meta) {
 	base.conf.AtimeMode = mode
 	if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
 		t.Fatalf("reading the source made its snapshot differ: %v %s", same, st)
+	}
+}
+
+// testSnapshotHardlinks checks that names of one file inside a snapshotted tree
+// stay links to one copy, and that such a snapshot is deleted cleanly.
+func testSnapshotHardlinks(t *testing.T, m Meta) {
+	ctx := Background()
+	var dir, sub, file Ino
+	if st := m.Mkdir(ctx, RootInode, "linkSrc", 0755, 022, 0, &dir, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Mkdir(ctx, dir, "sub", 0755, 022, 0, &sub, &Attr{}); st != 0 {
+		t.Fatalf("mkdir sub: %s", st)
+	}
+	if st := m.Create(ctx, dir, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	for _, l := range []struct {
+		parent Ino
+		name   string
+	}{{dir, "g"}, {sub, "h"}, {RootInode, "linkOutside"}} {
+		if st := m.Link(ctx, file, l.parent, l.name, &Attr{}); st != 0 {
+			t.Fatalf("link %s: %s", l.name, st)
+		}
+	}
+	root, st := m.CreateSnapshot(ctx, dir, "links", false, nil, nil)
+	if st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	var snapSub Ino
+	var attr Attr
+	if st := m.Lookup(ctx, root, "sub", &snapSub, &attr, false); st != 0 {
+		t.Fatalf("lookup sub: %s", st)
+	}
+	var copies []Ino
+	for _, p := range []struct {
+		parent Ino
+		name   string
+	}{{root, "f"}, {root, "g"}, {snapSub, "h"}} {
+		var ino Ino
+		if st := m.Lookup(ctx, p.parent, p.name, &ino, &attr, false); st != 0 {
+			t.Fatalf("lookup %s in snapshot: %s", p.name, st)
+		}
+		copies = append(copies, ino)
+		// the name outside the tree is not part of the snapshot
+		if attr.Nlink != 3 {
+			t.Fatalf("copy of %s has %d links, want 3", p.name, attr.Nlink)
+		}
+		if attr.Flags&FlagSnapshot == 0 {
+			t.Fatalf("copy of %s is not frozen", p.name)
+		}
+	}
+	if copies[0] == file || copies[0] != copies[1] || copies[0] != copies[2] {
+		t.Fatalf("names of one file were copied as %v, want one new inode", copies)
+	}
+	if st := m.Unlink(ctx, snapSub, "h"); st != syscall.EPERM {
+		t.Fatalf("unlinking a hard link inside a snapshot should be EPERM, got %s", st)
+	}
+	if st := m.DeleteSnapshot(ctx, "links", nil); st != 0 {
+		t.Fatalf("delete snapshot: %s", st)
+	}
+	if st := m.GetAttr(ctx, copies[0], &attr); st != syscall.ENOENT {
+		t.Fatalf("the linked copy outlived its snapshot: %s", st)
+	}
+	if st := m.GetAttr(ctx, file, &attr); st != 0 || attr.Nlink != 4 {
+		t.Fatalf("the source lost links: %s, nlink %d", st, attr.Nlink)
 	}
 }
 
