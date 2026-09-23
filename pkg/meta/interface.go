@@ -566,8 +566,10 @@ type Meta interface {
 	GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno
 	// GetTreeSummary returns a summary in tree structure
 	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, sortBy TreeSort, updateProgress func(count uint64, bytes uint64)) syscall.Errno
-	// CreateSnapshot freezes a copy of the tree at src under .snapshots/name.
-	CreateSnapshot(ctx Context, src Ino, name string, count, total *uint64) (Ino, syscall.Errno)
+	// CreateSnapshot freezes a copy of the tree at src under .snapshots/name. Unless
+	// bestEffort is set, the copy is checked against src and retried, and EBUSY is
+	// returned if src kept changing, so the snapshot is the state of src at one instant.
+	CreateSnapshot(ctx Context, src Ino, name string, bestEffort bool, count, total *uint64) (Ino, syscall.Errno)
 	// ListSnapshots returns every snapshot of this volume.
 	ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno)
 	// DeleteSnapshot removes a snapshot and releases what it pinned.

@@ -938,7 +938,7 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if st := src.Write(ctx, file, 0, 0, Slice{Id: 300001, Size: 100, Len: 100}, time.Now()); st != 0 {
 					t.Fatalf("write f: %s", st)
 				}
-				snap, st := src.CreateSnapshot(ctx, dir, "s1", nil, nil)
+				snap, st := src.CreateSnapshot(ctx, dir, "s1", false, nil, nil)
 				if st != 0 {
 					t.Fatalf("create snapshot: %s", st)
 				}
@@ -999,6 +999,9 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if attr.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable || attr.Length != 100 {
 					t.Fatalf("snapshot file after load: flags %d length %d", attr.Flags, attr.Length)
 				}
+				if same, st := dst.getBase().snapshotMatches(ctx, dir, snap); st != 0 || !same {
+					t.Fatalf("snapshot no longer matches its source after load: %v %s", same, st)
+				}
 
 				for _, name := range []string{usedSpace, totalInodes} {
 					want, _ := src.getBase().en.getCounter(name)
@@ -1010,7 +1013,7 @@ func TestLoadDumpSnapshots(t *testing.T) {
 				if next, _ := dst.getBase().en.getCounter("nextTrash"); next >= int64(SnapshotInode-TrashInode) {
 					t.Fatalf("nextTrash %d ran into the snapshot range", next)
 				}
-				snap2, st := dst.CreateSnapshot(ctx, dir, "s2", nil, nil)
+				snap2, st := dst.CreateSnapshot(ctx, dir, "s2", false, nil, nil)
 				if st != 0 {
 					t.Fatalf("snapshot after load: %s", st)
 				}

@@ -3440,6 +3440,19 @@ func (m *kvMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) sy
 	return 0
 }
 
+func (m *kvMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno) {
+	prefix := m.xattrKey(inode, "")
+	vals, err := m.scanValues(ctx, prefix, -1, nil)
+	if err != nil {
+		return nil, errno(err)
+	}
+	xs := make(map[string][]byte, len(vals))
+	for k, v := range vals {
+		xs[k[len(prefix):]] = v
+	}
+	return xs, 0
+}
+
 func (m *kvMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno {
 	defer m.timeit("ListXattr", time.Now())
 	inode = m.checkRoot(inode)

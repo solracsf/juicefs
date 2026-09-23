@@ -191,6 +191,7 @@ func testMeta(t *testing.T, m Meta) {
 	testSnapshotFlag(t, m)
 	testSnapshotRoot(t, m)
 	testSnapshot(t, m)
+	testSnapshotConsistency(t, m)
 	testSnapshotLeakedInodes(t, m)
 	testSnapshotCompact(t, m)
 	testSnapshotDelete(t, m)
@@ -4949,7 +4950,7 @@ func testSnapshot(t *testing.T, m Meta) {
 	}
 	usedSpace, usedInodes := totalSpace-availSpace, iused
 	var count, total uint64
-	root, st := m.CreateSnapshot(ctx, src, "snap1", &count, &total)
+	root, st := m.CreateSnapshot(ctx, src, "snap1", false, &count, &total)
 	if st != 0 {
 		t.Fatalf("create snapshot: %s", st)
 	}
@@ -5090,7 +5091,7 @@ func testSnapshot(t *testing.T, m Meta) {
 	if len(snaps) != 1 || snaps[0].Name != "snap1" || snaps[0].Inode != root {
 		t.Fatalf("ListSnapshots = %+v, want one entry named snap1", snaps)
 	}
-	if _, st := m.CreateSnapshot(ctx, src, "snap1", nil, nil); st != syscall.EEXIST {
+	if _, st := m.CreateSnapshot(ctx, src, "snap1", false, nil, nil); st != syscall.EEXIST {
 		t.Fatalf("a duplicate snapshot name should be EEXIST, got %s", st)
 	}
 
@@ -5099,20 +5100,20 @@ func testSnapshot(t *testing.T, m Meta) {
 	if st := m.Create(ctx, src, "plain", 0644, 022, 0, &plain, &Attr{}); st != 0 {
 		t.Fatalf("create plain: %s", st)
 	}
-	if _, st := m.CreateSnapshot(ctx, plain, "ofafile", nil, nil); st != syscall.ENOTDIR {
+	if _, st := m.CreateSnapshot(ctx, plain, "ofafile", false, nil, nil); st != syscall.ENOTDIR {
 		t.Fatalf("snapshotting a file should be ENOTDIR, got %s", st)
 	}
 	// snapshots are taken of live state only: no snapshot-owned inode is a
 	// source, whatever path reaches it
 	for name, ino := range map[string]Ino{"the snapshot tree": SnapshotInode, "a snapshot": root, "a snapshot dir": snapSub} {
-		if _, st := m.CreateSnapshot(ctx, ino, "ofsnapshot", nil, nil); st != syscall.EPERM {
+		if _, st := m.CreateSnapshot(ctx, ino, "ofsnapshot", false, nil, nil); st != syscall.EPERM {
 			t.Fatalf("snapshotting %s should be EPERM, got %s", name, st)
 		}
 	}
 	if st := m.Link(ctx, snapFile, src, "linked", &Attr{}); st != syscall.EPERM {
 		t.Fatalf("linking a snapshot file into the live tree should be EPERM, got %s", st)
 	}
-	if _, st := m.CreateSnapshot(ctx, TrashInode, "oftrash", nil, nil); st != syscall.EPERM {
+	if _, st := m.CreateSnapshot(ctx, TrashInode, "oftrash", false, nil, nil); st != syscall.EPERM {
 		t.Fatalf("snapshotting the trash should be EPERM, got %s", st)
 	}
 }
@@ -5152,6 +5153,100 @@ func testSnapshotLeakedInodes(t *testing.T, m Meta) {
 // Compacting a file merges its slices and drops the references the old ones
 // held. A snapshot shares those slices, so its own reference has to keep them
 // alive: without it the snapshot would still list slices whose data was freed.
+// testSnapshotConsistency checks the second pass of a snapshot: every kind of
+// change made to the tree after its copy must show up, and reads must not.
+func testSnapshotConsistency(t *testing.T, m Meta) {
+	ctx := Background()
+	base := m.getBase()
+	n := 0
+	slice := func(size uint32) Slice {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			t.Fatalf("new slice: %s", st)
+		}
+		return Slice{Id: id, Size: size, Len: size}
+	}
+	setup := func() (dir, file, sub, root Ino) {
+		n++
+		name := fmt.Sprintf("consist%d", n)
+		if st := m.Mkdir(ctx, RootInode, name, 0755, 022, 0, &dir, &Attr{}); st != 0 {
+			t.Fatalf("mkdir: %s", st)
+		}
+		if st := m.Mkdir(ctx, dir, "sub", 0755, 022, 0, &sub, &Attr{}); st != 0 {
+			t.Fatalf("mkdir sub: %s", st)
+		}
+		if st := m.Create(ctx, dir, "f", 0644, 022, 0, &file, &Attr{}); st != 0 {
+			t.Fatalf("create: %s", st)
+		}
+		if st := m.Write(ctx, file, 0, 0, slice(100), time.Now()); st != 0 {
+			t.Fatalf("write: %s", st)
+		}
+		if st := m.SetXattr(ctx, file, "user.k", []byte("v"), 0); st != 0 {
+			t.Fatalf("setxattr: %s", st)
+		}
+		root, st := m.CreateSnapshot(ctx, dir, name, false, nil, nil)
+		if st != 0 {
+			t.Fatalf("create snapshot of an idle tree: %s", st)
+		}
+		if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
+			t.Fatalf("a fresh snapshot differs from its idle source: %v %s", same, st)
+		}
+		return
+	}
+	var ino Ino
+	var attr Attr
+	var length uint64
+	for what, change := range map[string]func(dir, file, sub Ino) syscall.Errno{
+		"write":       func(dir, file, sub Ino) syscall.Errno { return m.Write(ctx, file, 0, 0, slice(10), time.Now()) },
+		"truncate":    func(dir, file, sub Ino) syscall.Errno { return m.Truncate(ctx, file, 0, 50, &attr, false) },
+		"fallocate":   func(dir, file, sub Ino) syscall.Errno { return m.Fallocate(ctx, file, 0, 0, 8192, &length) },
+		"chmod":       func(dir, file, sub Ino) syscall.Errno { return m.SetAttr(ctx, file, SetAttrMode, 0, &Attr{Mode: 0600}) },
+		"chown":       func(dir, file, sub Ino) syscall.Errno { return m.SetAttr(ctx, file, SetAttrUID, 0, &Attr{Uid: 1234}) },
+		"utimes":      func(dir, file, sub Ino) syscall.Errno { return m.SetAttr(ctx, sub, SetAttrMtime, 0, &Attr{Mtime: 1}) },
+		"setxattr":    func(dir, file, sub Ino) syscall.Errno { return m.SetXattr(ctx, file, "user.k", []byte("w"), 0) },
+		"removexattr": func(dir, file, sub Ino) syscall.Errno { return m.RemoveXattr(ctx, file, "user.k") },
+		"addxattr":    func(dir, file, sub Ino) syscall.Errno { return m.SetXattr(ctx, sub, "user.n", []byte("x"), 0) },
+		"create":      func(dir, file, sub Ino) syscall.Errno { return m.Create(ctx, dir, "g", 0644, 022, 0, &ino, &attr) },
+		"mkdir":       func(dir, file, sub Ino) syscall.Errno { return m.Mkdir(ctx, sub, "deeper", 0755, 022, 0, &ino, &attr) },
+		"symlink":     func(dir, file, sub Ino) syscall.Errno { return m.Symlink(ctx, sub, "l", "../f", &ino, &attr) },
+		"link":        func(dir, file, sub Ino) syscall.Errno { return m.Link(ctx, file, sub, "hard", &attr) },
+		"unlink":      func(dir, file, sub Ino) syscall.Errno { return m.Unlink(ctx, dir, "f") },
+		"rmdir":       func(dir, file, sub Ino) syscall.Errno { return m.Rmdir(ctx, dir, "sub") },
+		"rename": func(dir, file, sub Ino) syscall.Errno {
+			return m.Rename(ctx, dir, "f", dir, "f2", 0, &ino, &attr)
+		},
+		"move": func(dir, file, sub Ino) syscall.Errno {
+			return m.Rename(ctx, dir, "f", sub, "f", 0, &ino, &attr)
+		},
+	} {
+		dir, file, sub, root := setup()
+		if st := change(dir, file, sub); st != 0 {
+			t.Fatalf("%s: %s", what, st)
+		}
+		if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || same {
+			t.Fatalf("a %s after the copy went unnoticed: %v %s", what, same, st)
+		}
+	}
+
+	// reads move atime, which is not a change of the tree
+	dir, file, sub, root := setup()
+	mode := base.conf.AtimeMode
+	base.conf.AtimeMode = StrictAtime
+	time.Sleep(1100 * time.Millisecond) // strictatime skips updates within a second
+	var slices []Slice
+	if st := m.Read(ctx, file, 0, &slices); st != 0 {
+		t.Fatalf("read: %s", st)
+	}
+	var entries []*Entry
+	if st := m.Readdir(ctx, sub, 0, &entries); st != 0 {
+		t.Fatalf("readdir: %s", st)
+	}
+	base.conf.AtimeMode = mode
+	if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
+		t.Fatalf("reading the source made its snapshot differ: %v %s", same, st)
+	}
+}
+
 func testSnapshotCompact(t *testing.T, m Meta) {
 	c, ok := m.(compactor)
 	if !ok {
@@ -5196,7 +5291,7 @@ func testSnapshotCompact(t *testing.T, m Meta) {
 		write(uint32(i) * 1000)
 	}
 
-	if _, st := m.CreateSnapshot(ctx, dir, "compact-snap", nil, nil); st != 0 {
+	if _, st := m.CreateSnapshot(ctx, dir, "compact-snap", false, nil, nil); st != 0 {
 		t.Fatalf("create snapshot: %s", st)
 	}
 	var snapDir, snapFile Ino
@@ -5309,7 +5404,7 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 		return total - avail, iused
 	}
 
-	root, st := m.CreateSnapshot(ctx, dir, "del1", nil, nil)
+	root, st := m.CreateSnapshot(ctx, dir, "del1", false, nil, nil)
 	if st != 0 {
 		t.Fatalf("create snapshot: %s", st)
 	}
@@ -5374,7 +5469,7 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 	}
 
 	// a delete that died right after detaching is finished by the reaper, at once
-	root2, st := m.CreateSnapshot(ctx, dir, "del2", nil, nil)
+	root2, st := m.CreateSnapshot(ctx, dir, "del2", false, nil, nil)
 	if st != 0 {
 		t.Fatalf("create snapshot: %s", st)
 	}
@@ -5425,16 +5520,16 @@ func testSnapshotDelete(t *testing.T, m Meta) {
 	limited.MaxSnapshots = len(snaps) + 1
 	base.setFormat(&limited)
 	defer base.setFormat(&format)
-	if _, st := m.CreateSnapshot(ctx, dir, "cap1", nil, nil); st != 0 {
+	if _, st := m.CreateSnapshot(ctx, dir, "cap1", false, nil, nil); st != 0 {
 		t.Fatalf("create snapshot below the limit: %s", st)
 	}
-	if _, st := m.CreateSnapshot(ctx, dir, "cap2", nil, nil); st != syscall.EDQUOT {
+	if _, st := m.CreateSnapshot(ctx, dir, "cap2", false, nil, nil); st != syscall.EDQUOT {
 		t.Fatalf("a snapshot over the limit should be EDQUOT, got %s", st)
 	}
 	if st := m.DeleteSnapshot(ctx, "cap1", nil); st != 0 {
 		t.Fatalf("delete snapshot: %s", st)
 	}
-	if _, st := m.CreateSnapshot(ctx, dir, "cap2", nil, nil); st != 0 {
+	if _, st := m.CreateSnapshot(ctx, dir, "cap2", false, nil, nil); st != 0 {
 		t.Fatalf("create snapshot after making room: %s", st)
 	}
 	// a create that passed the early check alongside another one is still

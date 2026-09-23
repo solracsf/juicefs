@@ -390,7 +390,7 @@ func TestVFSSnapshotRoot(t *testing.T) {
 	if listed() {
 		t.Fatalf("%s is listed before any snapshot exists", meta.SnapshotName)
 	}
-	root, st := v.Meta.CreateSnapshot(meta.Background(), fe.Inode, "s", nil, nil)
+	root, st := v.Meta.CreateSnapshot(meta.Background(), fe.Inode, "s", false, nil, nil)
 	if st != 0 {
 		t.Fatalf("create snapshot: %s", st)
 	}

@@ -4337,6 +4337,18 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 	return 0
 }
 
+func (m *redisMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno) {
+	vals, err := m.rdb.HGetAll(ctx, m.xattrKey(inode)).Result()
+	if err != nil {
+		return nil, errno(err)
+	}
+	xs := make(map[string][]byte, len(vals))
+	for k, v := range vals {
+		xs[k] = []byte(v)
+	}
+	return xs, 0
+}
+
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
 	inodeKey := m.inodeKey(inode)
 	xattrKey := m.xattrKey(inode)

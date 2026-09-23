@@ -42,6 +42,13 @@ is fast and shares its data with the original, but it does consume inodes and
 metadata space. Snapshots are read-only and live under /.snapshots. They are
 not counted against the volume capacity or any quota; "list" reports their usage.
 
+A snapshot holds the tree as it was at one instant. The tree is copied entry by
+entry, then checked again: if anything changed meanwhile, the copy is taken
+again, and create fails if the tree keeps changing. With --best-effort, the
+first copy is kept whatever changed, so it may hold only some of the changes
+made during the copy. Data a client has written but not yet flushed is never
+part of a snapshot.
+
 Examples:
 # Snapshot the whole volume
 $ juicefs snapshot create redis://localhost --path / --name daily-2026-08-20
@@ -64,6 +71,10 @@ $ juicefs snapshot delete redis://localhost --name before-upgrade`,
 			&cli.StringFlag{
 				Name:  "name",
 				Usage: "name of the snapshot",
+			},
+			&cli.BoolFlag{
+				Name:  "best-effort",
+				Usage: "keep the copy even if the tree changes while it is taken (create only)",
 			},
 		},
 		Subcommands: []*cli.Command{
@@ -126,7 +137,7 @@ func snapshotCreate(c *cli.Context) error {
 			}
 		}
 	}()
-	root, st := m.CreateSnapshot(ctx, src, name, &count, &total)
+	root, st := m.CreateSnapshot(ctx, src, name, c.Bool("best-effort"), &count, &total)
 	close(done)
 	bar.SetTotal(int64(total))
 	bar.SetCurrent(int64(count))

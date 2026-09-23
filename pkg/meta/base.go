@@ -134,6 +134,8 @@ type engine interface {
 	doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tinode *Ino, attr, tattr *Attr) syscall.Errno
 	doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno
 	doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno
+	// doGetXattrs returns every extended attribute of inode, by name
+	doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno)
 	doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno
 	doTouchAtime(ctx Context, inode Ino, attr *Attr, ts time.Time) (bool, error)
 	doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno)
@@ -3185,6 +3187,10 @@ func (m *baseMeta) checkSnapshotSessions(ctx Context) syscall.Errno {
 
 const snapshotHeartbeat = time.Hour
 
+// snapshotAttempts bounds how many times a snapshot is retried while its tree
+// keeps changing under the copy.
+const snapshotAttempts = 3
+
 // storedFormat reads the format as the metadata engine holds it, which may be
 // newer than the copy this client loaded.
 func (m *baseMeta) storedFormat() (*Format, error) {
@@ -3276,7 +3282,7 @@ func (m *baseMeta) checkDumpedFloor(dumped string) error {
 
 // CreateSnapshot freezes a copy of the tree at src under .snapshots/name. The
 // copy shares its data with the original: only metadata is written.
-func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, total *uint64) (Ino, syscall.Errno) {
+func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort bool, count, total *uint64) (Ino, syscall.Errno) {
 	if m.conf.ReadOnly {
 		return 0, syscall.EROFS
 	}
@@ -3343,22 +3349,52 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 		*total = sum.Dirs + sum.Files
 	}
 
+	if count == nil {
+		count = new(uint64)
+	}
+	attempts := snapshotAttempts
+	if bestEffort {
+		attempts = 1
+	}
+	for i := 1; ; i++ {
+		atomic.StoreUint64(count, 0)
+		root, st := m.buildSnapshot(ctx, src, name, count, !bestEffort)
+		if st == 0 {
+			if st = m.en.doAttachDirNode(ctx, SnapshotInode, root, name); st == 0 {
+				return root, 0
+			}
+		}
+		if root != 0 {
+			if eno := m.en.doCleanupDetachedNode(ctx, root); eno != 0 {
+				logger.Errorf("remove partial snapshot %d: %s", root, eno)
+			}
+		}
+		if st != syscall.EBUSY || i == attempts {
+			if st == syscall.EBUSY {
+				logger.Errorf("the tree kept changing while snapshot %s was taken, %d times; "+
+					"stop writing to it, or take a best-effort snapshot", name, attempts)
+			}
+			return 0, st
+		}
+		logger.Warnf("the tree changed while snapshot %s was taken, trying again (%d/%d)", name, i+1, attempts)
+	}
+}
+
+// buildSnapshot copies src into a new detached root. When consistent is set, it
+// then compares the copy with src and returns EBUSY if they differ: every entry
+// was copied before the comparison started and found unchanged after, so the
+// copy is the state of src at one instant between the two passes.
+func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint64, consistent bool) (Ino, syscall.Errno) {
 	next, err := m.en.incrCounter("nextSnapshot", 1)
 	if err != nil {
 		return 0, errno(err)
 	}
 	root := SnapshotInode + Ino(next)
-
-	if count == nil {
-		count = new(uint64)
-	}
-	cmode := uint8(CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_SNAPSHOT)
-	concurrent := make(chan struct{}, CLONE_DEFAULT_CONCURRENCY)
-	dst := root
 	// built detached, so an interrupted snapshot is reaped by the background
 	// cleanup instead of being left half visible under .snapshots; the timestamp
 	// is kept fresh, or gc would reap a build that outlasts its one-day threshold
 	building := make(chan struct{})
+	defer close(building)
 	go func() {
 		ticker := time.NewTicker(snapshotHeartbeat)
 		defer ticker.Stop()
@@ -3373,18 +3409,149 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, count, tota
 			}
 		}
 	}()
-	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, concurrent)
-	close(building)
-	if st == 0 {
-		st = m.en.doAttachDirNode(ctx, SnapshotInode, root, name)
-	}
-	if st != 0 {
-		if eno := m.en.doCleanupDetachedNode(ctx, root); eno != 0 {
-			logger.Errorf("remove partial snapshot %d: %s", root, eno)
+	cmode := uint8(CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_SNAPSHOT)
+	dst := root
+	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
+	if st == 0 && consistent {
+		var same bool
+		if same, st = m.snapshotMatches(ctx, src, root); st == 0 && !same {
+			st = syscall.EBUSY
 		}
-		return 0, st
 	}
-	return root, 0
+	return root, st
+}
+
+// snapshotMatches reports whether the snapshot tree at dst still holds what the
+// live tree at src holds: the same entries, attributes and extended attributes.
+// Access times and link counts are left out: reads move the former, and the
+// latter only count the links a snapshot copies.
+func (m *baseMeta) snapshotMatches(ctx Context, src, dst Ino) (bool, syscall.Errno) {
+	var sa, da Attr
+	if st := m.en.doGetAttr(ctx, src, &sa); st != 0 {
+		if st == syscall.ENOENT {
+			return false, 0
+		}
+		return false, st
+	}
+	if st := m.en.doGetAttr(ctx, dst, &da); st != 0 {
+		return false, st
+	}
+	var differs atomic.Bool
+	st := m.snapshotEntryMatches(ctx, src, dst, &sa, &da, &differs, make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
+	return st == 0 && !differs.Load(), st
+}
+
+func snapshotAttrMatches(s, d *Attr) bool {
+	return s.Typ == d.Typ && s.Mode == d.Mode && s.Uid == d.Uid && s.Gid == d.Gid && s.Rdev == d.Rdev &&
+		s.Length == d.Length && s.Mtime == d.Mtime && s.Mtimensec == d.Mtimensec &&
+		s.Ctime == d.Ctime && s.Ctimensec == d.Ctimensec && cloneFlags(s.Flags, CLONE_MODE_SNAPSHOT) == d.Flags &&
+		s.AccessACL == d.AccessACL && s.DefaultACL == d.DefaultACL
+}
+
+func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr, differs *atomic.Bool, concurrent chan struct{}) syscall.Errno {
+	if differs.Load() {
+		return 0
+	}
+	if !snapshotAttrMatches(sa, da) {
+		differs.Store(true)
+		return 0
+	}
+	sx, st := m.en.doGetXattrs(ctx, src)
+	if st != 0 {
+		return st
+	}
+	dx, st := m.en.doGetXattrs(ctx, dst)
+	if st != 0 {
+		return st
+	}
+	if len(sx) != len(dx) {
+		differs.Store(true)
+		return 0
+	}
+	for k, v := range sx {
+		if w, ok := dx[k]; !ok || !bytes.Equal(v, w) {
+			differs.Store(true)
+			return 0
+		}
+	}
+	if sa.Typ != TypeDirectory {
+		return 0
+	}
+
+	// the copy is frozen, so hold its entries and walk the live side against them
+	copied := make(map[string]*Entry)
+	if st := m.listDir(ctx, dst, func(e *Entry) { copied[string(e.Name)] = e }); st != 0 {
+		return st
+	}
+	var g errgroup.Group
+	st = m.listDir(ctx, src, func(e *Entry) {
+		if differs.Load() {
+			return
+		}
+		d, ok := copied[string(e.Name)]
+		if !ok {
+			differs.Store(true)
+			return
+		}
+		delete(copied, string(e.Name))
+		check := func() error {
+			if st := m.snapshotEntryMatches(ctx, e.Inode, d.Inode, e.Attr, d.Attr, differs, concurrent); st != 0 {
+				return st
+			}
+			return nil
+		}
+		if e.Attr.Typ != TypeDirectory {
+			_ = check()
+			return
+		}
+		select {
+		case concurrent <- struct{}{}:
+			g.Go(func() error {
+				defer func() { <-concurrent }()
+				return check()
+			})
+		default:
+			if err := check(); err != nil {
+				g.Go(func() error { return err })
+			}
+		}
+	})
+	if err := g.Wait(); st == 0 && err != nil {
+		st = errno(err)
+	}
+	if st == syscall.ENOENT {
+		// the live directory went away
+		differs.Store(true)
+		return 0
+	}
+	if len(copied) > 0 {
+		differs.Store(true)
+	}
+	return st
+}
+
+// listDir calls fn for every entry of the directory ino but . and .., with attributes.
+func (m *baseMeta) listDir(ctx Context, ino Ino, fn func(*Entry)) syscall.Errno {
+	handler, st := m.NewDirHandler(ctx, ino, true, nil)
+	if st != 0 {
+		return st
+	}
+	defer handler.Close()
+	for offset := 0; ; {
+		entries, st := handler.List(ctx, offset)
+		if st != 0 {
+			return st
+		}
+		if len(entries) == 0 {
+			return 0
+		}
+		for _, e := range entries {
+			if name := string(e.Name); name != "." && name != ".." {
+				fn(e)
+			}
+		}
+		offset += len(entries)
+	}
 }
 
 // DeleteSnapshot removes the snapshot called name. Its root is detached first,

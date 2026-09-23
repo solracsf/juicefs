@@ -4332,6 +4332,22 @@ func (m *dbMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) sy
 	}))
 }
 
+func (m *dbMeta) doGetXattrs(ctx Context, inode Ino) (map[string][]byte, syscall.Errno) {
+	var xs map[string][]byte
+	err := m.roTxn(ctx, func(s *xorm.Session) error {
+		var rows []xattr
+		if err := s.Where("inode = ?", inode).Find(&rows, &xattr{Inode: inode}); err != nil {
+			return err
+		}
+		xs = make(map[string][]byte, len(rows))
+		for _, x := range rows {
+			xs[x.Name] = x.Value
+		}
+		return nil
+	})
+	return xs, errno(err)
+}
+
 func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno {
 	defer m.timeit("ListXattr", time.Now())
 	inode = m.checkRoot(inode)
