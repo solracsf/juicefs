@@ -2621,6 +2621,18 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 				walkError = true
 				logger.Errorf("Walk %s: %s", fpath, st)
 			}
+			// snapshots are not reachable by name from the root, but their data has to
+			// be checked like the rest; they are not counted in the volume usage
+			var snapAttr Attr
+			if fpath == "/" && m.en.doGetAttr(ctx, SnapshotInode, &snapAttr) == 0 {
+				if st := m.walk(ctx, SnapshotInode, "/"+SnapshotName, &snapAttr, func(ctx Context, inode Ino, path string, attr *Attr) {
+					nodes <- &node{inode, path, attr}
+					atomic.AddInt64(&count, 1)
+				}); st != 0 {
+					walkError = true
+					logger.Errorf("Walk /%s: %s", SnapshotName, st)
+				}
+			}
 			if needSyncVolumeStat && m.getFormat().TrashDays > 0 {
 				trashAttr := Attr{Typ: TypeDirectory}
 				if st := m.walk(ctx, TrashInode, "/.trash", &trashAttr, func(_ Context, ino Ino, _ string, a *Attr) {
@@ -2732,7 +2744,8 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 					}
 				}
 
-				if format.DirStats {
+				// the hidden snapshot root keeps no usage of its own, snapshots being exempt
+				if format.DirStats && inode != SnapshotInode {
 					stat, st := m.en.doGetDirStat(ctx, inode, false)
 					if st == syscall.ENOENT {
 						continue

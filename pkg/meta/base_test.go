@@ -5083,6 +5083,19 @@ func testSnapshot(t *testing.T, m Meta) {
 	if !found {
 		t.Fatalf("the snapshot's slice is not in the live set, gc would free its blocks")
 	}
+	// fsck of the whole volume reaches the snapshots, which no entry of the root names
+	m.getBase().doFlushDirStat()
+	// earlier tests can leave the root's nlink off on some engines; that is not what is tested here
+	if err := m.Check(ctx, "/", &CheckOpt{Repair: true}); err != nil {
+		t.Fatalf("repair the root: %s", err)
+	}
+	opt := &CheckOpt{Recursive: true, Slices: make(map[Ino][]Slice)}
+	if err := m.Check(ctx, "/", opt); err != nil {
+		t.Fatalf("fsck of a volume with snapshots: %s", err)
+	}
+	if ss := opt.Slices[snapFile]; len(ss) != 1 || ss[0].Id != 200001 {
+		t.Fatalf("fsck of the volume saw %v for the snapshot file, want slice 200001", ss)
+	}
 
 	// listing, and names are unique
 	snaps, st := m.ListSnapshots(ctx)
