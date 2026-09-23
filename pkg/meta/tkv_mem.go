@@ -69,7 +69,7 @@ func (tx *memTxn) get(key []byte) []byte {
 	it := tx.store.get(k)
 	if it != nil {
 		tx.observed[k] = it.ver
-		return it.value
+		return bytes.Clone(it.value) // callers may rewrite it in place, as real stores allow
 	} else {
 		tx.observed[k] = 0
 		return nil
@@ -94,7 +94,7 @@ func (tx *memTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byt
 			return false
 		}
 		tx.observed[it.key] = it.ver
-		return handler(key, it.value)
+		return handler(key, bytes.Clone(it.value))
 	})
 }
 
