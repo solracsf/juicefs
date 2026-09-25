@@ -3215,21 +3215,29 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
 }
 
+// atVolumeRoot reports whether parent, as a caller names it, is the root of the
+// volume: the snapshot root hangs there only, so on a mount of a subdirectory,
+// whose root is another inode, its name is an ordinary one.
+func (m *baseMeta) atVolumeRoot(parent Ino) bool {
+	return parent == RootInode && m.root == RootInode
+}
+
 // isReservedEntry reports whether name under parent is the name of a hidden root,
 // in either spelling, so it must never be created through the normal namespace
-// calls; hidesEntry says whether the name resolves to one here.
+// calls; hidesEntry says whether the name resolves to one here. The trash is
+// reserved under the root of every mount, as it always was.
 func (m *baseMeta) isReservedEntry(parent Ino, name string) bool {
-	return parent == RootInode && (isTrashName(name) || isSnapshotName(name))
+	return parent == RootInode && isTrashName(name) || m.atVolumeRoot(parent) && isSnapshotName(name)
 }
 
 // hidesEntry reports whether name under parent is a hidden root that must not be
 // removed or renamed. A real /.snapshots from before snapshots existed is not
 // hidden until the snapshot root is created, so it can still be moved away.
 func (m *baseMeta) hidesEntry(ctx Context, parent Ino, name string) bool {
-	if parent != RootInode || name != TrashName && name != SnapshotName {
-		return false
+	if parent == RootInode && name == TrashName {
+		return true
 	}
-	return name == TrashName || m.en.doGetAttr(ctx, SnapshotInode, nil) != syscall.ENOENT
+	return m.atVolumeRoot(parent) && name == SnapshotName && m.en.doGetAttr(ctx, SnapshotInode, nil) != syscall.ENOENT
 }
 
 // SnapshotInfo describes one snapshot under the hidden .snapshots root.

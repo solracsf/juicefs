@@ -112,3 +112,58 @@ func TestSnapshotReservedSpellings(t *testing.T) {
 		}
 	})
 }
+
+// The snapshot root lives under the root of the volume only, so on a mount of a
+// subdirectory its name is an ordinary one: it can be created there, and a real
+// directory of that name in the subdirectory can be renamed and removed.
+func TestSnapshotReservedAtVolumeRootOnly(t *testing.T) {
+	forEachSurfaceMeta(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		base := m.getBase()
+		var sub, src, ino Ino
+		if st := m.Mkdir(ctx, RootInode, "sub", 0755, 0, 0, &sub, nil); st != 0 {
+			t.Fatalf("mkdir sub: %s", st)
+		}
+		if st := m.Mkdir(ctx, RootInode, "src", 0755, 0, 0, &src, nil); st != 0 {
+			t.Fatalf("mkdir src: %s", st)
+		}
+		if _, st := m.CreateSnapshot(ctx, src, "s", false, nil, nil); st != 0 {
+			t.Fatalf("create snapshot: %s", st)
+		}
+		if st := m.Mkdir(ctx, RootInode, SnapshotName, 0755, 0, 0, &ino, nil); st != syscall.EPERM {
+			t.Fatalf("mkdir /%s: %s, want EPERM", SnapshotName, st)
+		}
+		if st := m.Rmdir(ctx, RootInode, SnapshotName); st != syscall.EPERM {
+			t.Fatalf("rmdir /%s: %s, want EPERM", SnapshotName, st)
+		}
+
+		base.chroot(sub)
+		defer base.chroot(RootInode)
+		if st := m.Mkdir(ctx, RootInode, SnapshotName, 0755, 0, 0, &ino, nil); st != 0 {
+			t.Fatalf("mkdir %s at the root of a subdir mount: %s", SnapshotName, st)
+		}
+		if st := m.Lookup(ctx, RootInode, SnapshotName, &ino, &Attr{}, false); st != 0 || ino == SnapshotInode {
+			t.Fatalf("lookup %s at the root of a subdir mount: %s, inode %d", SnapshotName, st, ino)
+		}
+		if st := m.Rename(ctx, RootInode, SnapshotName, RootInode, "moved", 0, &ino, nil); st != 0 {
+			t.Fatalf("rename %s at the root of a subdir mount: %s", SnapshotName, st)
+		}
+		if st := m.Rename(ctx, RootInode, "moved", RootInode, SnapshotName, 0, &ino, nil); st != 0 {
+			t.Fatalf("rename back to %s at the root of a subdir mount: %s", SnapshotName, st)
+		}
+		if st := m.Create(ctx, RootInode, "f", 0644, 0, 0, &ino, nil); st != 0 {
+			t.Fatalf("create f: %s", st)
+		}
+		if st := m.Unlink(ctx, RootInode, "f"); st != 0 {
+			t.Fatalf("unlink f: %s", st)
+		}
+		if st := m.Rmdir(ctx, RootInode, SnapshotName); st != 0 {
+			t.Fatalf("rmdir %s at the root of a subdir mount: %s", SnapshotName, st)
+		}
+		// the snapshot itself is untouched
+		base.chroot(RootInode)
+		if st := m.Lookup(ctx, SnapshotInode, "s", &ino, &Attr{}, false); st != 0 {
+			t.Fatalf("the snapshot is gone: %s", st)
+		}
+	})
+}
