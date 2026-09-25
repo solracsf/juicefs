@@ -3480,11 +3480,23 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 // snapshotMatches distrusts those instead of trusting stale-looking attributes
 // (see (*snapshotBuild).trusts).
 func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint64, consistent bool) (Ino, syscall.Errno) {
-	next, err := m.en.incrCounter("nextSnapshot", 1)
-	if err != nil {
-		return 0, errno(err)
+	var root Ino
+	for {
+		next, err := m.en.incrCounter("nextSnapshot", 1)
+		if err != nil {
+			return 0, errno(err)
+		}
+		root = SnapshotInode + Ino(next)
+		// a load by a client unaware of snapshots leaves the counter behind the
+		// snapshots it loaded: an inode that is taken is skipped, never overwritten
+		st := m.en.doGetAttr(ctx, root, nil)
+		if st == syscall.ENOENT {
+			break
+		} else if st != 0 {
+			return 0, st
+		}
+		logger.Warnf("inode %d is taken, skipping it for snapshot %s", root, name)
 	}
-	root := SnapshotInode + Ino(next)
 	// built detached, so an interrupted snapshot is reaped by the background
 	// cleanup instead of being left half visible under .snapshots; the timestamp
 	// is kept fresh, or gc would reap a build that outlasts its one-day threshold
@@ -3508,8 +3520,10 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 	dst := root
 	build := &snapshotBuild{copies: make(map[Ino]*snapshotCopy), listed: make(map[Ino]time.Time)}
 	if consistent {
-		if build.window, err = m.dirMtimeWindow(); err != nil {
+		if window, err := m.dirMtimeWindow(); err != nil {
 			return 0, errno(err)
+		} else {
+			build.window = window
 		}
 	}
 	ctx = ctx.WithValue(snapshotBuildKey{}, build)
@@ -3872,6 +3886,25 @@ func cloneFlags(flags, cmode uint8) uint8 {
 // lie above the trash range, and what they hold is refused as immutable.
 func trashed(p Ino) bool {
 	return p > TrashInode && p < SnapshotInode
+}
+
+// trashCounterInRange tells whether the nextTrash counter value next names an
+// inode in the trash range. A load by a client unaware of the range above it
+// counts the snapshot inodes as trash and leaves the counter past the range.
+func trashCounterInRange(next int64) bool {
+	return next > 0 && (TrashInode + Ino(next)).IsTrash()
+}
+
+// resetTrashCounter is the counter value of the trash directory to create when
+// the counter is out of range, given the highest trash directory that exists:
+// the engines repair the counter in the transaction that creates the directory.
+func resetTrashCounter(next int64, highest Ino) int64 {
+	var reset int64 = 1
+	if highest.IsTrash() {
+		reset = int64(highest-TrashInode) + 1
+	}
+	logger.Warnf("the trash counter ran past the trash range, at %d; starting over from %d", next, reset)
+	return reset
 }
 
 func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {

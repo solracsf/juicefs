@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"xorm.io/xorm"
 )
 
 // compatEngine names one metadata engine the compatibility tests run on, with
@@ -295,6 +297,133 @@ func TestFormatWriteKeepsVersions(t *testing.T) {
 			}
 			if below, err := belowVersion(after.MinClientVersion, before.MinClientVersion); err != nil || below {
 				t.Fatalf("min client version lowered from %q to %q by a stale config (%v)", before.MinClientVersion, after.MinClientVersion, err)
+			}
+		})
+	}
+}
+
+// setCounter writes a counter as a load by another client may have left it.
+func setCounter(t *testing.T, m Meta, name string, value int64) {
+	t.Helper()
+	var err error
+	switch m := m.(type) {
+	case *redisMeta:
+		err = m.rdb.Set(Background(), m.counterKey(name), value, 0).Err()
+	case *dbMeta:
+		err = m.txn(func(s *xorm.Session) error {
+			c := counter{Name: name}
+			ok, err := s.ForUpdate().Get(&c)
+			if err != nil {
+				return err
+			}
+			c.Value = value
+			if ok {
+				_, err = s.Cols("value").Update(&c, &counter{Name: name})
+			} else {
+				err = mustInsert(s, &c)
+			}
+			return err
+		})
+	case *kvMeta:
+		err = m.setValue(m.counterKey(name), packCounter(value))
+	default:
+		t.Fatalf("unknown engine %T", m)
+	}
+	if err != nil {
+		t.Fatalf("set counter %s: %s", name, err)
+	}
+}
+
+// A load by a client unaware of the snapshot range counts the snapshot inodes
+// as trash and leaves the trash counter past its range. The next hourly trash
+// directory must not be written in the snapshot range, where it would share
+// an inode with a snapshot: the counter starts over from the highest trash
+// directory there is, in the transaction that creates the new one.
+func TestTrashCounterPastRange(t *testing.T) {
+	for _, e := range compatEngines() {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := Background()
+			m := newCompatMeta(t, e.uri(t))
+			f := compatFormat()
+			f.TrashDays = 1
+			if err := m.Init(f, false); err != nil {
+				t.Fatalf("enable trash: %s", err)
+			}
+			b := m.getBase()
+			// an hourly directory from earlier, at the first trash inode
+			var earlier Ino
+			attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
+			if st := b.en.doMknod(ctx, TrashInode, "2000-01-01-00", TypeDirectory, 0555, 0, "", &earlier, &attr); st != 0 {
+				t.Fatalf("earlier trash directory: %s", st)
+			}
+			if earlier != TrashInode+1 {
+				t.Fatalf("earlier trash directory got inode %d, want %d", earlier, TrashInode+1)
+			}
+			past := int64(SnapshotInode-TrashInode) + 5
+			setCounter(t, m, "nextTrash", past)
+
+			var file Ino
+			if st := m.Create(ctx, RootInode, "f", 0644, 0, 0, &file, nil); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			if st := m.Unlink(ctx, RootInode, "f"); st != 0 {
+				t.Fatalf("unlink with the trash counter past its range: %s", st)
+			}
+			if trash := b.subTrash.inode; trash != TrashInode+2 {
+				t.Fatalf("the hourly trash directory got inode %d, want %d", trash, TrashInode+2)
+			}
+			if st := b.en.doGetAttr(ctx, TrashInode+Ino(past)+1, nil); st != syscall.ENOENT {
+				t.Fatalf("inode %d in the snapshot range: %v, want ENOENT", TrashInode+Ino(past)+1, st)
+			}
+			if v, err := b.en.getCounter("nextTrash"); err != nil || v != 2 {
+				t.Fatalf("trash counter %d %v after the repair, want 2", v, err)
+			}
+			// the counter goes on from there
+			var later Ino
+			if st := b.en.doMknod(ctx, TrashInode, "2000-01-01-01", TypeDirectory, 0555, 0, "", &later, &attr); st != 0 || later != TrashInode+3 {
+				t.Fatalf("later trash directory: %v, inode %d, want %d", st, later, TrashInode+3)
+			}
+		})
+	}
+}
+
+// A load by a client unaware of snapshots leaves the snapshot counter behind
+// the snapshots it loaded: a new snapshot skips the inodes that are taken
+// instead of overwriting the snapshot that holds them.
+func TestSnapshotSkipsTakenInodes(t *testing.T) {
+	for _, e := range compatEngines() {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := Background()
+			m := newCompatMeta(t, e.uri(t))
+			var dir, file Ino
+			if st := m.Mkdir(ctx, RootInode, "d", 0755, 0, 0, &dir, nil); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := m.Create(ctx, dir, "f", 0644, 0, 0, &file, nil); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			first, st := m.CreateSnapshot(ctx, dir, "s1", false, nil, nil)
+			if st != 0 {
+				t.Fatalf("create snapshot: %s", st)
+			}
+			setCounter(t, m, "nextSnapshot", 0)
+			second, st := m.CreateSnapshot(ctx, dir, "s2", false, nil, nil)
+			if st != 0 {
+				t.Fatalf("create snapshot with the counter behind: %s", st)
+			}
+			if second == first {
+				t.Fatalf("the second snapshot took the inode of the first, %d", first)
+			}
+			var got Ino
+			var attr Attr
+			if st := m.Lookup(ctx, SnapshotInode, "s1", &got, &attr, false); st != 0 || got != first {
+				t.Fatalf("first snapshot after the second: %v, inode %d, want %d", st, got, first)
+			}
+			if st := m.Lookup(ctx, first, "f", &got, &attr, false); st != 0 || attr.Flags&FlagSnapshot == 0 {
+				t.Fatalf("file in the first snapshot: %v, flags %d", st, attr.Flags)
+			}
+			if snaps, st := m.ListSnapshots(ctx); st != 0 || len(snaps) != 2 {
+				t.Fatalf("snapshots: %v, %d, want 2", st, len(snaps))
 			}
 		})
 	}

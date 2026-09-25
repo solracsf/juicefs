@@ -1457,6 +1457,20 @@ func (m *kvMeta) doReadlink(ctx Context, inode Ino, noatime bool) (atime int64, 
 	return
 }
 
+// highestTrashDir is the highest inode in the trash range among the entries of
+// the trash root, or 0 if there is none.
+func (m *kvMeta) highestTrashDir(tx *kvTxn) Ino {
+	var highest Ino
+	prefix := m.entryKey(TrashInode, "")
+	tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
+		if _, ino := m.parseEntry(v); ino.IsTrash() && ino > highest {
+			highest = ino
+		}
+		return true
+	})
+	return highest
+}
+
 func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, path string, inode *Ino, attr *Attr) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
 		var pattr Attr
@@ -1509,6 +1523,10 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 		} else if parent == TrashInode { // user's inode is allocated by prefetch, trash inode is allocated on demand
 			key := m.counterKey("nextTrash")
 			next := tx.incrBy(key, 1)
+			if !trashCounterInRange(next) {
+				next = resetTrashCounter(next, m.highestTrashDir(tx))
+				tx.set(key, packCounter(next))
+			}
 			*inode = TrashInode + Ino(next)
 		}
 		mode &= 07777

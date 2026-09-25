@@ -1893,11 +1893,26 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 			}
 			return syscall.EEXIST
 		} else if parent == TrashInode {
-			if next, err := m.incrSessionCounter(s, "nextTrash", 1); err != nil {
+			next, err := m.incrSessionCounter(s, "nextTrash", 1)
+			if err != nil {
 				return err
-			} else {
-				*inode = TrashInode + Ino(next)
 			}
+			if !trashCounterInRange(next) {
+				var e edge
+				ok, err := s.Where("parent = ? AND inode < ?", TrashInode, SnapshotInode).Desc("inode").Get(&e)
+				if err != nil {
+					return err
+				}
+				var highest Ino
+				if ok {
+					highest = e.Inode
+				}
+				next = resetTrashCounter(next, highest)
+				if _, err = s.Cols("value").Update(&counter{Name: "nextTrash", Value: next}, &counter{Name: "nextTrash"}); err != nil {
+					return err
+				}
+			}
+			*inode = TrashInode + Ino(next)
 		}
 
 		n := node{Inode: *inode}

@@ -1468,6 +1468,10 @@ func (m *redisMeta) doReadlink(ctx Context, inode Ino, noatime bool) (atime int6
 }
 
 func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, path string, inode *Ino, attr *Attr) syscall.Errno {
+	keys := []string{m.inodeKey(parent), m.entryKey(parent)}
+	if parent == TrashInode {
+		keys = append(keys, m.nextTrashKey())
+	}
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		var pattr Attr
 		a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
@@ -1522,11 +1526,26 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 			}
 			return syscall.EEXIST
 		} else if parent == TrashInode {
-			if next, err := tx.Incr(ctx, m.nextTrashKey()).Result(); err != nil { // Some inode will be wasted if conflict happens
+			// the counter is watched, and set with the directory
+			next, err := tx.Get(ctx, m.nextTrashKey()).Int64()
+			if err != nil && err != redis.Nil {
 				return err
-			} else {
-				*inode = TrashInode + Ino(next)
 			}
+			next++
+			if !trashCounterInRange(next) {
+				vals, err := tx.HGetAll(ctx, m.entryKey(TrashInode)).Result()
+				if err != nil {
+					return err
+				}
+				var highest Ino
+				for _, v := range vals {
+					if _, ino := m.parseEntry([]byte(v)); ino.IsTrash() && ino > highest {
+						highest = ino
+					}
+				}
+				next = resetTrashCounter(next, highest)
+			}
+			*inode = TrashInode + Ino(next)
 		}
 		mode &= 07777
 		if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
@@ -1586,6 +1605,9 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 		attr.Mode = m.inheritMode(ctx, _type, pattr.Gid, pattr.Mode, attr.Mode)
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			if parent == TrashInode {
+				pipe.Set(ctx, m.nextTrashKey(), int64(*inode-TrashInode), 0)
+			}
 			pipe.Set(ctx, m.inodeKey(*inode), m.marshal(attr), 0)
 			if updateParent {
 				pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
@@ -1610,7 +1632,7 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 			return nil
 		})
 		return err
-	}, m.inodeKey(parent), m.entryKey(parent)))
+	}, keys...))
 }
 
 func (m *redisMeta) txnLogKey() string {
