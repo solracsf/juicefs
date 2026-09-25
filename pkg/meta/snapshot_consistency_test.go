@@ -468,3 +468,70 @@ func TestSnapshotConcurrentDeletes(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotListCreated checks that a snapshot reports when it was taken,
+// not the ctime it copied from a source that may be much older, that
+// recording it does not break validation against the source, that it stays
+// hidden from ListXattr, and that a dump and load keeps it.
+func TestSnapshotListCreated(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		base := m.getBase()
+		dir := snapshotMkdir(t, m, RootInode, "d")
+		var attr Attr
+		if st := base.en.doGetAttr(ctx, dir, &attr); st != 0 {
+			t.Fatalf("getattr: %s", st)
+		}
+		old := time.Now().Add(-72 * time.Hour)
+		attr.Mtime, attr.Ctime = old.Unix(), old.Unix()
+		if st := base.en.doRepair(ctx, dir, &attr, true); st != 0 {
+			t.Fatalf("age the directory: %s", st)
+		}
+		before := time.Now().Truncate(time.Second)
+		root, st := m.CreateSnapshot(ctx, dir, "s", false, nil, nil)
+		if st != 0 {
+			t.Fatalf("snapshot: %s", st)
+		}
+		created := func() time.Time {
+			snaps, st := m.ListSnapshots(ctx)
+			if st != 0 || len(snaps) != 1 {
+				t.Fatalf("list: %v %s", snaps, st)
+			}
+			return snaps[0].Created
+		}
+		if c := created(); c.Before(before) || c.After(time.Now()) {
+			t.Fatalf("snapshot of a directory last changed at %s, taken at %s, reports creation %s", old, before, c)
+		}
+		// the snapshot root still matches what it copied: recording the creation
+		// time does not make the comparison see a difference
+		if same, st := base.snapshotMatches(ctx, dir, root); st != 0 || !same {
+			t.Fatalf("recording the creation time changed the snapshot: %v %s", same, st)
+		}
+		var names []byte
+		if st := m.ListXattr(ctx, root, &names); st != 0 || len(names) != 0 {
+			t.Fatalf("snapshot root lists attributes %q: %s", names, st)
+		}
+		want := created()
+
+		f, err := os.CreateTemp(t.TempDir(), "dump")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := m.DumpMeta(f, RootInode, 1, false, false, false); err != nil {
+			t.Fatalf("dump: %s", err)
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.LoadMeta(f); err != nil {
+			t.Fatalf("load: %s", err)
+		}
+		if got := created(); !got.Equal(want) {
+			t.Fatalf("creation time %s became %s across dump and load", want, got)
+		}
+	})
+}

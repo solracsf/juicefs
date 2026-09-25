@@ -4362,7 +4362,7 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 	}
 	*names = nil
 	for _, name := range vals {
-		if strings.HasPrefix(name, snapshotHoldPrefix) {
+		if strings.HasPrefix(name, snapshotHoldPrefix) || name == snapshotCreatedKey {
 			continue
 		}
 		*names = append(*names, []byte(name)...)

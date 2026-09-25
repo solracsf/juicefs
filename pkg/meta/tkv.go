@@ -3494,7 +3494,7 @@ func (m *kvMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 	*names = nil
 	prefix := len(m.xattrKey(inode, ""))
 	for _, name := range keys {
-		if bytes.HasPrefix(name[prefix:], []byte(snapshotHoldPrefix)) {
+		if bytes.HasPrefix(name[prefix:], []byte(snapshotHoldPrefix)) || string(name[prefix:]) == snapshotCreatedKey {
 			continue
 		}
 		*names = append(*names, name[prefix:]...)

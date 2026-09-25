@@ -4385,7 +4385,7 @@ func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 		}
 		*names = nil
 		for _, x := range xs {
-			if strings.HasPrefix(x.Name, snapshotHoldPrefix) {
+			if strings.HasPrefix(x.Name, snapshotHoldPrefix) || x.Name == snapshotCreatedKey {
 				continue
 			}
 			*names = append(*names, []byte(x.Name)...)

@@ -2384,7 +2384,7 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	default:
 		return syscall.EINVAL
 	}
-	if strings.HasPrefix(name, snapshotHoldPrefix) {
+	if strings.HasPrefix(name, snapshotHoldPrefix) || name == snapshotCreatedKey {
 		return syscall.EPERM
 	}
 
@@ -2404,7 +2404,7 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 		return syscall.EINVAL
 	}
 
-	if strings.HasPrefix(name, snapshotHoldPrefix) {
+	if strings.HasPrefix(name, snapshotHoldPrefix) || name == snapshotCreatedKey {
 		return syscall.EPERM
 	}
 
@@ -3265,6 +3265,13 @@ const snapshotAttempts = 3
 // one per tag, set and removed only through HoldSnapshot and ReleaseSnapshot.
 const snapshotHoldPrefix = "juicefs.snapshot.hold."
 
+// snapshotCreatedKey names the extended attribute that records when a snapshot
+// was taken, as a decimal Unix nanosecond timestamp, set once by CreateSnapshot
+// on the root. Its own ctime cannot be used for that: it is copied from the
+// source and validated against it, so it is whatever the source's ctime was,
+// not when the snapshot itself was made.
+const snapshotCreatedKey = "juicefs.snapshot.created"
+
 // maxHoldTag keeps the attribute a hold is stored as well within the 255 bytes
 // an extended attribute name may take.
 const maxHoldTag = 200
@@ -3439,6 +3446,13 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 		root, st := m.buildSnapshot(ctx, src, name, count, !bestEffort)
 		if st == 0 {
 			if st = m.en.doAttachDirNode(ctx, SnapshotInode, root, name); st == 0 {
+				// doSnapshotHold writes straight to the xattr hash without the
+				// ctime bump doSetXattr would give it, so the root still matches
+				// what it copied for as long as the snapshot lives
+				created := strconv.FormatInt(time.Now().UnixNano(), 10)
+				if st := m.en.doSnapshotHold(ctx, name, snapshotCreatedKey, []byte(created), true); st != 0 {
+					logger.Warnf("record creation time of snapshot %s: %s", name, st)
+				}
 				return root, 0
 			}
 		}
@@ -3622,10 +3636,11 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 	if st != 0 {
 		return st
 	}
-	// holds are taken on a snapshot after it is published and are not part of it
+	// holds are taken on a snapshot after it is published, and its creation time
+	// is recorded after this comparison runs on it; neither is part of the copy
 	for _, xs := range []map[string][]byte{sx, dx} {
 		for k := range xs {
-			if strings.HasPrefix(k, snapshotHoldPrefix) {
+			if strings.HasPrefix(k, snapshotHoldPrefix) || k == snapshotCreatedKey {
 				delete(xs, k)
 			}
 		}
@@ -3776,8 +3791,18 @@ func (m *baseMeta) ListSnapshots(ctx Context) ([]*SnapshotInfo, syscall.Errno) {
 		if st != 0 {
 			return nil, st
 		}
+		// the root's ctime is copied from, and validated against, the source; a
+		// snapshot made before this field existed falls back to it
+		created := time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec))
+		if xs, st := m.en.doGetXattrs(ctx, e.Inode); st == 0 {
+			if v, ok := xs[snapshotCreatedKey]; ok {
+				if ns, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+					created = time.Unix(0, ns)
+				}
+			}
+		}
 		snaps = append(snaps, &SnapshotInfo{Inode: e.Inode, Name: string(e.Name),
-			Created: time.Unix(e.Attr.Ctime, int64(e.Attr.Ctimensec)), Holds: holds})
+			Created: created, Holds: holds})
 	}
 	slices.SortFunc(snaps, func(a, b *SnapshotInfo) int { return strings.Compare(a.Name, b.Name) })
 	return snaps, 0
