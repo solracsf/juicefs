@@ -163,7 +163,8 @@ If you wish to use a storage system that is not listed, feel free to submit a re
 | [Storj](#storj)                                             | `storj`    |
 | [Vultr Object Storage](#vultr-object-storage)               | `s3`       |
 | [Cloudflare R2](#r2)                                        | `s3`       |
-| [Bunny Storage](#bunny)                                     | `bunny`    |
+| [Bunny Storage (native API)](#bunny)                        | `bunny`    |
+| [Bunny Storage (S3 API)](#bunny-s3)                         | `bunny-s3` |
 | [Alibaba Cloud OSS](#alibaba-cloud-oss)                     | `oss`      |
 | [Tencent Cloud COS](#tencent-cloud-cos)                     | `cos`      |
 | [Huawei Cloud OBS](#huawei-cloud-obs)                       | `obs`      |
@@ -563,7 +564,7 @@ Cloudflare R2 `ListObjects` API is not fully S3 compatible (result list is not s
 
 ### Bunny Storage {#bunny}
 
-Bunny Storage offers a non-S3 compatible object storage with multiple performance tiers and many storage regions. It uses [it uses a custom API](https://docs.bunny.net/reference/storage-api).
+Bunny Storage offers object storage with multiple performance tiers and many storage regions. The `bunny` storage type uses its [native HTTP API](https://docs.bunny.net/reference/storage-api), and is the option for storage zones created without S3 compatibility. For storage zones created with S3 compatibility, use [`bunny-s3`](#bunny-s3) instead.
 
 This is not included by default, please build it with tag `bunny`
 
@@ -578,6 +579,37 @@ juicefs format \
     --bucket "https://uk.storage.bunnycdn.com/myzone" \ # https://<Endpoint>/<Zonename>
     myjfs
 ```
+
+### Bunny Storage (S3 API) {#bunny-s3}
+
+The `bunny-s3` storage type uses the [S3-compatible API](https://bunny.net/docs/storage/s3) of Bunny Storage and is included in the default build. S3 compatibility can only be enabled when a storage zone is created, not later.
+
+The access key is the storage zone name (it can be omitted), and the secret key is the storage zone password. `--bucket` takes one of these forms, where `<region>` is one of `de`, `ny`, `sg`, `uk`, `se`, `la`, `jh` and `syd`:
+
+- `https://<region>-s3.storage.bunnycdn.com/<zone>`
+- `https://<zone>.<region>-s3.storage.bunnycdn.com`
+
+```shell
+juicefs format \
+    --storage bunny-s3 \
+    --bucket https://de-s3.storage.bunnycdn.com/myzone \
+    --secret-key <zone-password> \
+    ... \
+    myjfs
+```
+
+For `juicefs sync`, use `bunny-s3://<zone>:<zone-password>@<zone>.<region>-s3.storage.bunnycdn.com/<prefix>/`. In the form without the zone in the host, `bunny-s3://<zone>:<zone-password>@<region>-s3.storage.bunnycdn.com/<prefix>/`, the zone is taken from the access key and the whole path is a prefix inside the zone.
+
+Bunny's S3 API differs from Amazon S3 in several ways, which `bunny-s3` works around:
+
+- Checksums: Bunny does not keep custom metadata, so JuiceFS cannot store the CRC32C checksum it uses elsewhere to verify downloads. Uploads are still validated: each object is sent with its SHA-256 checksum and each multipart part with its MD5, and Bunny rejects data corrupted in transit. Downloads are not verified; enable [data encryption](../security/encryption.md) if you need end-to-end integrity checks.
+- Directories: Bunny deletes a directory together with everything below it. `bunny-s3` therefore never deletes keys ending with `/`, and leaves directory entries out of listings. Empty directories stay in the storage zone, for example after `juicefs destroy` or `juicefs sync --delete-dst`, and can be removed from the Bunny dashboard. For the same reason, `juicefs sync --dirs` does not copy empty directories out of a storage zone.
+- Listings: Bunny sorts a directory by its name without the trailing slash, and its continuation tokens can skip an object named like a directory or return a directory twice. `bunny-s3` pages with its own markers and builds the common prefixes of a listing by directory itself, so listings stay complete and in byte order. A listing by directory, as `juicefs sync --list-threads` does, costs up to one more request per subdirectory.
+- Object names: Bunny removes `"`, `<` and `>` from object names and cuts them at `?`, so two different names can end up as the same object. It also stores, but never lists, objects whose name is longer than 255 characters counting the zone name and a slash (246 characters for a zone with an 8-character name), and rejects names starting or ending with a space. `bunny-s3` refuses such names. The data of a JuiceFS volume never uses them, but `juicefs sync` reports such files as failed.
+- Storage classes and object tags are not supported.
+- Limits: Bunny allows 500 requests per second per storage zone. It throttles requests with `503 SlowDown`, and can answer some requests of a burst with transient server errors such as `500 InternalError`, without storing the object. `bunny-s3` retries both, up to 4 attempts in all, after the delay given by `Retry-After` when Bunny sends one. If several clients share a storage zone and requests keep failing with `SlowDown`, server errors or timeouts, lower `--max-uploads` and `--max-downloads`, or `--threads` for `juicefs sync`.
+
+The naming, directory and listing behaviors above were observed on a live storage zone and are not documented by Bunny, so they may change.
 
 ### Alibaba Cloud OSS
 
