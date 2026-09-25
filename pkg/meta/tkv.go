@@ -554,6 +554,10 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 				return errors.Wrap(err, "delete user group quota")
 			}
 		}
+		// the versions are kept again in the write, against what is stored then
+		if err = format.keepVersions(body); err != nil {
+			return err
+		}
 		if err = format.update(&old, force); err != nil {
 			return errors.Wrap(err, "update format")
 		}
@@ -4031,7 +4035,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	}
 	defer func() {
 		if err == nil {
-			err = m.checkDumpedFloor(setting.MinClientVersion)
+			err = m.checkDumpedVersion(setting.MetaVersion)
 		}
 	}()
 	defer func() {

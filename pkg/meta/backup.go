@@ -435,7 +435,7 @@ type DumpOption struct {
 	Threads    int
 	Progress   func(name string, cnt int)
 
-	minClientVersion string // recorded in the dumped format
+	metaVersion int // recorded in the dumped format
 }
 
 func (opt *DumpOption) check() *DumpOption {
@@ -453,7 +453,7 @@ func (m *baseMeta) dumpFormat(ctx Context, opt *DumpOption, ch chan<- *dumpedRes
 	if err != nil {
 		return err
 	}
-	opt.minClientVersion = f.MinClientVersion
+	opt.metaVersion = f.MetaVersion
 	if !opt.KeepSecret {
 		f.RemoveSecret()
 	}

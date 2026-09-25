@@ -785,6 +785,7 @@ func (m *baseMeta) newSessionInfo() []byte {
 	}
 	buf, err := json.Marshal(&SessionInfo{
 		Version:      version.Version(),
+		MetaVersion:  MaxVersion,
 		HostName:     host,
 		IPAddrs:      addrs,
 		MountPoint:   m.conf.MountPoint,
@@ -3232,23 +3233,30 @@ type SnapshotInfo struct {
 	Holds   []string // tags of the holds that keep it from being deleted
 }
 
-// checkSnapshotSessions refuses to freeze a tree while a client too old to
-// understand snapshots is still mounted. The format gate only runs at mount, so
-// a session that started earlier keeps serving and could still be asked to
-// compact or rmr a frozen tree.
+// checkSnapshotSessions refuses to freeze a tree while a client that does not
+// understand snapshots is still mounted. Such a client leaves the volume on its
+// own once it sees the raised metadata version, at its next refresh, but until
+// then it keeps serving and could still be asked to compact or rmr a frozen
+// tree. Whether a client understands snapshots is read from its session, not
+// from its release: it records the metadata version it supports, and one that
+// records none, or no version at all, is a build that predates snapshots. A
+// session that has expired is left out: its client is gone, as when it left on
+// seeing the raised version, or cut off from the metadata engine, and it is
+// already treated as gone by the volume, whose clients clean it up.
 func (m *baseMeta) checkSnapshotSessions(ctx Context) syscall.Errno {
 	sessions, err := m.en.ListSessions()
 	if err != nil {
 		logger.Warnf("list sessions: %s", err)
 		return errno(err)
 	}
-	minVer := version.Parse(MinSnapshotVersion)
+	now := time.Now()
 	for _, s := range sessions {
-		if s.Version == "" {
-			continue
-		}
-		if r, e := version.CompareVersions(version.Parse(s.Version), minVer); e == nil && r < 0 {
-			logger.Errorf("client %d on %s runs %s, which predates snapshot support", s.Sid, s.HostName, s.Version)
+		if s.MetaVersion < SnapshotVersion && !s.Expire.Before(now) {
+			ver := s.Version
+			if ver == "" {
+				ver = "an unknown version"
+			}
+			logger.Errorf("client %d on %s runs %s, which does not support snapshots; wait for it to leave or unmount it", s.Sid, s.HostName, ver)
 			return syscall.EPERM
 		}
 	}
@@ -3303,66 +3311,58 @@ func belowVersion(v, floor string) (bool, error) {
 	return r < 0, err
 }
 
-// raiseMinClientVersion stops clients that predate snapshots from mounting,
-// since they would neither honor the freeze nor spare snapshot roots in gc. It
-// rewrites the stored format, never lowering an existing floor, and then only
-// the floor of the in-memory copy, which holds its secrets decrypted.
-func (m *baseMeta) raiseMinClientVersion() error {
+// raiseMetaVersion moves the volume to SnapshotVersion, which keeps every client
+// that does not support snapshots off it: such a client would neither honor the
+// freeze nor spare snapshot roots in gc, and it refuses a metadata version above
+// the one it supports at every command, whatever release it is. It rewrites the
+// stored format, never lowering the version, and then only the version of the
+// in-memory copy, which holds its secrets decrypted.
+func (m *baseMeta) raiseMetaVersion() error {
 	format, err := m.storedFormat()
 	if err != nil {
 		return err
 	}
-	if below, err := belowVersion(format.MinClientVersion, MinSnapshotVersion); err != nil || !below {
-		return err
+	if format.MetaVersion >= SnapshotVersion {
+		return nil
 	}
-	old, loaded := format.MinClientVersion, *m.getFormat()
-	format.MinClientVersion = MinSnapshotVersion
+	old, loaded := format.MetaVersion, *m.getFormat()
+	format.MetaVersion = SnapshotVersion
 	if err = m.en.doInit(format, false); err != nil {
 		return err
 	}
-	loaded.MinClientVersion = MinSnapshotVersion
+	loaded.MetaVersion = SnapshotVersion
 	m.setFormat(&loaded)
-	if old == "" {
-		old = "none"
-	}
-	logger.Warnf("Raised the minimum client version of volume %s from %s to %s for snapshots: "+
-		"older clients can no longer mount it, even if this snapshot fails", format.Name, old, MinSnapshotVersion)
+	logger.Warnf("Raised the metadata version of volume %s from %d to %d for snapshots: "+
+		"clients without snapshot support can no longer use it, even if this snapshot fails", format.Name, old, SnapshotVersion)
 	return nil
 }
 
 // dumpedFormat is the format a dump records: the loaded one, with the stored
-// minimum client version when a snapshot has raised it since the load.
+// metadata version when a snapshot has raised it since the load.
 func (m *baseMeta) dumpedFormat() (Format, error) {
 	format := *m.getFormat()
 	stored, err := m.storedFormat()
 	if err != nil {
 		return format, err
 	}
-	if below, err := belowVersion(format.MinClientVersion, stored.MinClientVersion); err != nil {
-		return format, err
-	} else if below {
-		format.MinClientVersion = stored.MinClientVersion
-	}
+	format.MetaVersion = max(format.MetaVersion, stored.MetaVersion)
 	return format, nil
 }
 
-// checkDumpedFloor fails a dump when the volume raised its minimum client
-// version while the dump ran, past the one the dump recorded: the first
-// snapshot raises it before writing anything, so such a dump may hold a
-// snapshot without the version that keeps older clients from loading it.
-func (m *baseMeta) checkDumpedFloor(dumped string) error {
+// checkDumpedVersion fails a dump when the volume raised its metadata version
+// while the dump ran, past the one the dump recorded: the first snapshot raises
+// it before writing anything, so such a dump may hold a snapshot without the
+// version that keeps clients unaware of snapshots from loading it.
+func (m *baseMeta) checkDumpedVersion(dumped int) error {
 	stored, err := m.storedFormat()
 	if err != nil {
 		return err
 	}
-	if below, err := belowVersion(dumped, stored.MinClientVersion); err != nil || !below {
-		return err
+	if stored.MetaVersion <= dumped {
+		return nil
 	}
-	if dumped == "" {
-		dumped = "none"
-	}
-	return fmt.Errorf("the minimum client version of the volume was raised from %s to %s while it was dumped, "+
-		"so the dump may hold snapshots it does not guard; dump it again", dumped, stored.MinClientVersion)
+	return fmt.Errorf("the metadata version of the volume was raised from %d to %d while it was dumped, "+
+		"so the dump may hold snapshots it does not guard; dump it again", dumped, stored.MetaVersion)
 }
 
 // CreateSnapshot freezes a copy of the tree at src under .snapshots/name. The
@@ -3395,10 +3395,10 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 	if st := m.Access(ctx, src, MODE_MASK_R|MODE_MASK_X, &srcAttr); st != 0 {
 		return 0, st
 	}
-	// raise the floor first so no new old client can mount, then refuse while
-	// one that is already mounted is still running
-	if err := m.raiseMinClientVersion(); err != nil {
-		logger.Errorf("raise min client version for snapshots: %s", err)
+	// raise the version first so no new unaware client can mount, then refuse
+	// while one that is already mounted is still running
+	if err := m.raiseMetaVersion(); err != nil {
+		logger.Errorf("raise the metadata version for snapshots: %s", err)
 		return 0, syscall.EIO
 	}
 	if st := m.checkSnapshotSessions(ctx); st != 0 {
@@ -5031,7 +5031,7 @@ func (m *baseMeta) DumpMetaV2(ctx Context, w io.Writer, opt *DumpOption) error {
 	if err := bak.writeFooter(w); err != nil {
 		return err
 	}
-	return m.checkDumpedFloor(opt.minClientVersion)
+	return m.checkDumpedVersion(opt.metaVersion)
 }
 
 func (m *baseMeta) LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error {

@@ -4997,9 +4997,9 @@ func testSnapshot(t *testing.T, m Meta) {
 	if count != 3 || total != 3 {
 		t.Fatalf("snapshot copied %d of %d entries, want 3 of 3", count, total)
 	}
-	// clients too old for snapshots can no longer mount the volume
-	if f, err := m.Load(false); err != nil || f.MinClientVersion != MinSnapshotVersion {
-		t.Fatalf("min client version after the first snapshot: %+v %v, want %s", f, err, MinSnapshotVersion)
+	// clients without snapshot support can no longer use the volume
+	if f, err := m.Load(false); err != nil || f.MetaVersion != SnapshotVersion {
+		t.Fatalf("meta version after the first snapshot: %+v %v, want %d", f, err, SnapshotVersion)
 	}
 
 	// reachable by path, and every copied inode is frozen

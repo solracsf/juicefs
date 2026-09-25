@@ -34,7 +34,16 @@ import (
 
 const (
 	// MaxVersion is the max of supported versions.
-	MaxVersion = 1
+	MaxVersion = 2
+	// DefaultVersion is the metadata version a new volume is formatted at, the
+	// one every client reads. A volume moves to a higher version only when it
+	// first uses a feature that clients supporting the lower one cannot handle.
+	DefaultVersion = 1
+	// SnapshotVersion is the metadata version a volume takes at its first
+	// snapshot: from then on it may hold inodes in the snapshot range and frozen
+	// entries, which clients supporting at most DefaultVersion would neither
+	// spare in gc nor keep frozen.
+	SnapshotVersion = 2
 	// ChunkBits is the size of a chunk.
 	ChunkBits = 26
 	// ChunkSize is size of a chunk
@@ -150,10 +159,6 @@ func (i Ino) IsNormal() bool {
 
 var TrashName = ".trash"
 var SnapshotName = ".snapshots"
-
-// MinSnapshotVersion is the first client version that understands snapshots. It
-// names the dev pre-release so builds from the 1.5.0 line are accepted too.
-const MinSnapshotVersion = "1.5.0-dev"
 
 // isReservedEntry reports whether name is one of the hidden roots under the volume
 // root. They are resolved by Lookup rather than by a directory entry, so they must
@@ -403,12 +408,15 @@ func (s *TreeSummary) sortKey(by TreeSort) uint64 {
 }
 
 type SessionInfo struct {
-	Version    string
-	HostName   string
-	IPAddrs    []string `json:",omitempty"`
-	MountPoint string
-	MountTime  time.Time
-	ProcessID  int
+	Version string
+	// MetaVersion is the highest metadata version the client supports; clients
+	// that predate snapshots leave it out
+	MetaVersion int `json:",omitempty"`
+	HostName    string
+	IPAddrs     []string `json:",omitempty"`
+	MountPoint  string
+	MountTime   time.Time
+	ProcessID   int
 	// SkipDirMtime is this client's skip-dir-mtime setting: how long it may
 	// leave a directory's mtime and ctime alone after a change to its entries.
 	// A consistent snapshot build reads it from every session to know how long

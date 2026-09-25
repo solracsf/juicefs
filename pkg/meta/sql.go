@@ -661,6 +661,10 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 				return errors.Wrap(err, "drop table userGroupQuota")
 			}
 		}
+		// the versions are kept again in the write, against what is stored then
+		if err = format.keepVersions([]byte(s.Value)); err != nil {
+			return err
+		}
 		if err = format.update(&old, force); err != nil {
 			return errors.Wrap(err, "update format")
 		}
@@ -5085,7 +5089,7 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	}
 	defer func() {
 		if err == nil {
-			err = m.checkDumpedFloor(setting.MinClientVersion)
+			err = m.checkDumpedVersion(setting.MetaVersion)
 		}
 	}()
 	defer func() {

@@ -1095,8 +1095,8 @@ func (w *raisingWriter) Write(p []byte) (int, error) {
 	return w.Writer.Write(p)
 }
 
-// A dump records the minimum client version the volume has, not the one its
-// client loaded, and fails when the first snapshot raises it meanwhile.
+// A dump records the metadata version the volume has, not the one its client
+// loaded, and fails when the first snapshot raises it meanwhile.
 func TestDumpRecordsSnapshotFloor(t *testing.T) {
 	for _, engine := range []string{"redis", "sqlite3", "badger"} {
 		for _, format := range []string{"json", "v2"} {
@@ -1120,12 +1120,12 @@ func TestDumpRecordsSnapshotFloor(t *testing.T) {
 					decrypted := *loaded
 					decrypted.SecretKey = "decrypted"
 					m.getBase().setFormat(&decrypted)
-					if err := m.getBase().raiseMinClientVersion(); err != nil {
-						t.Errorf("raise min client version: %s", err)
+					if err := m.getBase().raiseMetaVersion(); err != nil {
+						t.Errorf("raise meta version: %s", err)
 					}
 					// the raising client keeps its format, secrets as decrypted
-					if f := m.getBase().getFormat(); f.SecretKey != "decrypted" || f.MinClientVersion != MinSnapshotVersion {
-						t.Errorf("format after the raise: secret %q, min client version %q", f.SecretKey, f.MinClientVersion)
+					if f := m.getBase().getFormat(); f.SecretKey != "decrypted" || f.MetaVersion != SnapshotVersion {
+						t.Errorf("format after the raise: secret %q, meta version %d", f.SecretKey, f.MetaVersion)
 					}
 					m.getBase().setFormat(loaded)
 				}
@@ -1145,8 +1145,8 @@ func TestDumpRecordsSnapshotFloor(t *testing.T) {
 				if err != nil {
 					t.Fatalf("load: %s", err)
 				}
-				if f, err := dst.Load(false); err != nil || f.MinClientVersion != MinSnapshotVersion {
-					t.Fatalf("dumped min client version: %+v %v, want %s", f, err, MinSnapshotVersion)
+				if f, err := dst.Load(false); err != nil || f.MetaVersion != SnapshotVersion {
+					t.Fatalf("dumped meta version: %+v %v, want %d", f, err, SnapshotVersion)
 				}
 			})
 		}
