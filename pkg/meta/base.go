@@ -145,6 +145,10 @@ type engine interface {
 	// doSnapshotHold adds (hold) or removes the extended attribute key on the root
 	// of snapshot name, in the transaction that checks the snapshot is still there
 	doSnapshotHold(ctx Context, name, key string, value []byte, hold bool) syscall.Errno
+	// dirMtimeWindow turns skip, a configured SkipDirMtime, into how long after a
+	// directory's mtime was set a change to its entries might still leave the
+	// mtime and ctime alone on this engine, which may apply skip differently
+	dirMtimeWindow(skip time.Duration) time.Duration
 	doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno
 	doTouchAtime(ctx Context, inode Ino, attr *Attr, ts time.Time) (bool, error)
 	doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno)
@@ -779,12 +783,13 @@ func (m *baseMeta) newSessionInfo() []byte {
 		}
 	}
 	buf, err := json.Marshal(&SessionInfo{
-		Version:    version.Version(),
-		HostName:   host,
-		IPAddrs:    addrs,
-		MountPoint: m.conf.MountPoint,
-		MountTime:  time.Now(),
-		ProcessID:  os.Getpid(),
+		Version:      version.Version(),
+		HostName:     host,
+		IPAddrs:      addrs,
+		MountPoint:   m.conf.MountPoint,
+		MountTime:    time.Now(),
+		ProcessID:    os.Getpid(),
+		SkipDirMtime: m.conf.SkipDirMtime,
 	})
 	if err != nil {
 		panic(err) // marshal SessionInfo should never fail
@@ -3455,7 +3460,10 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 // buildSnapshot copies src into a new detached root. When consistent is set, it
 // then compares the copy with src and returns EBUSY if they differ: every entry
 // was copied before the comparison started and found unchanged after, so the
-// copy is the state of src at one instant between the two passes.
+// copy is the state of src at one instant between the two passes -- except for
+// a directory that SkipDirMtime let change without moving its mtime or ctime;
+// snapshotMatches distrusts those instead of trusting stale-looking attributes
+// (see (*snapshotBuild).trusts).
 func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint64, consistent bool) (Ino, syscall.Errno) {
 	next, err := m.en.incrCounter("nextSnapshot", 1)
 	if err != nil {
@@ -3483,10 +3491,22 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 	}()
 	cmode := uint8(CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_SNAPSHOT)
 	dst := root
-	links := &snapshotLinks{copies: make(map[Ino]*snapshotCopy)}
-	st := m.cloneEntry(ctx.WithValue(snapshotLinksKey{}, links), src, SnapshotInode, name, &dst, cmode, 0, count, true,
-		make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
+	build := &snapshotBuild{copies: make(map[Ino]*snapshotCopy), listed: make(map[Ino]time.Time)}
+	if consistent {
+		if build.window, err = m.dirMtimeWindow(); err != nil {
+			return 0, errno(err)
+		}
+	}
+	ctx = ctx.WithValue(snapshotBuildKey{}, build)
+	st := m.cloneEntry(ctx, src, SnapshotInode, name, &dst, cmode, 0, count, true, make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
 	if st == 0 && consistent {
+		// a client that mounted since window was first measured runs its own
+		// SkipDirMtime, which the sessions above may not have counted yet
+		if window, err := m.dirMtimeWindow(); err != nil {
+			return root, errno(err)
+		} else if window > build.window {
+			build.window = window
+		}
 		var same bool
 		if same, st = m.snapshotMatches(ctx, src, root); st == 0 && !same {
 			st = syscall.EBUSY
@@ -3495,11 +3515,35 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 	return root, st
 }
 
+// dirMtimeWindow is the longest span, across every session on the volume this
+// one included, during which a change to a directory's entries might leave its
+// mtime and ctime alone: each client may run with its own SkipDirMtime, and
+// engines may apply it differently (see engine.dirMtimeWindow).
+func (m *baseMeta) dirMtimeWindow() (time.Duration, error) {
+	sessions, err := m.en.ListSessions()
+	if err != nil {
+		return 0, err
+	}
+	skip := m.conf.SkipDirMtime
+	for _, s := range sessions {
+		skip = max(skip, s.SkipDirMtime)
+	}
+	return m.en.dirMtimeWindow(skip), nil
+}
+
 // snapshotMatches reports whether the snapshot tree at dst still holds what the
 // live tree at src holds: the same entries, attributes and extended attributes,
 // and the same files behind the names of hard links. Access times and link
 // counts are left out: reads move the former, and the latter only count the
 // links a snapshot copies.
+//
+// Matching mtime and ctime do not by themselves prove a directory's entries
+// are unchanged: SkipDirMtime lets any client leave them alone for a while
+// after touching them. (*snapshotBuild).trusts only credits a directory whose
+// entries were listed for the copy at least a window past those times, since a
+// change landing after such a listing is then guaranteed to move them; one
+// listed sooner is treated as changed, which fails the comparison and sends
+// CreateSnapshot's caller back to retry.
 func (m *baseMeta) snapshotMatches(ctx Context, src, dst Ino) (bool, syscall.Errno) {
 	var sa, da Attr
 	if st := m.en.doGetAttr(ctx, src, &sa); st != 0 {
@@ -3596,6 +3640,10 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 		}
 	}
 	if sa.Typ != TypeDirectory {
+		return 0
+	}
+	if build, _ := ctx.Value(snapshotBuildKey{}).(*snapshotBuild); build != nil && !build.trusts(dst, sa) {
+		c.differs.Store(true)
 		return 0
 	}
 
@@ -4255,6 +4303,13 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	if attr.Typ != TypeDirectory {
 		return 0
 	}
+	build, _ := ctx.Value(snapshotBuildKey{}).(*snapshotBuild)
+	if build != nil {
+		// mark the moment we are about to read this directory's entries, before
+		// NewDirHandler lists them, so snapshotMatches can later tell whether
+		// SkipDirMtime could still be hiding a later change from that listing
+		build.listing(ino)
+	}
 	// Use DirHandler for batch processing to avoid loading all entries at once
 	handler, eno := m.NewDirHandler(ctx, srcIno, true, nil)
 	if eno == syscall.ENOENT {
@@ -4267,7 +4322,6 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 	cloneCtx := WrapWithCancel(ctx, ctx.Pid(), ctx.Uid(), ctx.Gids())
 	defer cloneCtx.Cancel()
-	links, _ := ctx.Value(snapshotLinksKey{}).(*snapshotLinks)
 
 	var g errgroup.Group
 	nlink := uint32(2)
@@ -4320,7 +4374,7 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 						eno = childEno
 					}
 				}
-			} else if links != nil && e.Attr.Nlink > 1 {
+			} else if build != nil && e.Attr.Nlink > 1 {
 				linked = append(linked, e)
 			} else {
 				nonDirEntries = append(nonDirEntries, e)
@@ -4343,7 +4397,7 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			}
 		}
 		for _, e := range linked {
-			if eno = m.cloneLinked(cloneCtx, links, e, ino, cmode, cumask, count); eno != 0 {
+			if eno = m.cloneLinked(cloneCtx, build, e, ino, cmode, cumask, count); eno != 0 {
 				break
 			}
 		}
@@ -4381,13 +4435,18 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	return eno
 }
 
-type snapshotLinksKey struct{}
+type snapshotBuildKey struct{}
 
-// snapshotLinks maps each hard-linked file of a tree being snapshotted to its
-// copy, so every name of the file in the tree ends up as a link to one copy.
-type snapshotLinks struct {
+// snapshotBuild is what one snapshot copy keeps while it is being built: each
+// hard-linked file of the tree mapped to its copy, so every name of the file
+// in the tree ends up as a link to one copy; and, for a consistent build, when
+// each directory's entries were listed for copying and how long a change to
+// them could go unnoticed without moving their mtime or ctime.
+type snapshotBuild struct {
 	sync.Mutex
 	copies map[Ino]*snapshotCopy
+	listed map[Ino]time.Time // by the inode of the copy
+	window time.Duration     // 0 for a best-effort build, which never checks it
 }
 
 type snapshotCopy struct {
@@ -4396,16 +4455,37 @@ type snapshotCopy struct {
 	st   syscall.Errno
 }
 
+// listing records that the entries of the directory copied as dst are about to
+// be read.
+func (b *snapshotBuild) listing(dst Ino) {
+	b.Lock()
+	b.listed[dst] = time.Now()
+	b.Unlock()
+}
+
+// trusts tells whether a live directory found to share dst's mtime and ctime
+// can be trusted not to have gained or lost entries since: only once dst's
+// entries were listed, and only if that listing came window or more after
+// those times, is any later change to the directory certain to have moved
+// them (see snapshotMatches). A directory never listed, or listed too soon
+// after its own times were set, is not trusted.
+func (b *snapshotBuild) trusts(dst Ino, attr *Attr) bool {
+	b.Lock()
+	listed, ok := b.listed[dst]
+	b.Unlock()
+	return ok && !time.Unix(attr.Mtime, int64(attr.Mtimensec)).Add(b.window).After(listed)
+}
+
 // cloneLinked copies e, a file with several links, the first time the snapshot
 // meets it, and links the copy under every other name it has in the tree.
-func (m *baseMeta) cloneLinked(ctx Context, links *snapshotLinks, e *Entry, parent Ino, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
-	links.Lock()
-	c, seen := links.copies[e.Inode]
+func (m *baseMeta) cloneLinked(ctx Context, build *snapshotBuild, e *Entry, parent Ino, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
+	build.Lock()
+	c, seen := build.copies[e.Inode]
 	if !seen {
 		c = &snapshotCopy{done: make(chan struct{})}
-		links.copies[e.Inode] = c
+		build.copies[e.Inode] = c
 	}
-	links.Unlock()
+	build.Unlock()
 	if !seen {
 		c.st = m.cloneEntry(ctx, e.Inode, parent, string(e.Name), &c.ino, cmode, cumask, count, false, nil)
 		close(c.done)

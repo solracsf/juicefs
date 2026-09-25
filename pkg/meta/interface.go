@@ -409,6 +409,11 @@ type SessionInfo struct {
 	MountPoint string
 	MountTime  time.Time
 	ProcessID  int
+	// SkipDirMtime is this client's skip-dir-mtime setting: how long it may
+	// leave a directory's mtime and ctime alone after a change to its entries.
+	// A consistent snapshot build reads it from every session to know how long
+	// a directory it lists might still be missing an unrecorded change.
+	SkipDirMtime time.Duration `json:",omitempty"`
 }
 
 type Flock struct {

@@ -6067,6 +6067,12 @@ func (m *dbMeta) doSnapshotHold(ctx Context, name, key string, value []byte, hol
 	}, SnapshotInode))
 }
 
+// dirMtimeWindow reports skip unchanged: a write here checks the elapsed time
+// against SkipDirMtime directly, with no retry-based scaling.
+func (m *dbMeta) dirMtimeWindow(skip time.Duration) time.Duration {
+	return skip
+}
+
 func (m *dbMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
 	return errno(m.txn(func(s *xorm.Session) error {
 		_, err := s.Cols("added").Update(&detachedNode{Added: time.Now().Unix()}, &detachedNode{Inode: inode})

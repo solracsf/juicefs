@@ -6076,6 +6076,12 @@ func (m *redisMeta) doSnapshotHold(ctx Context, name, key string, value []byte, 
 	}, m.entryKey(SnapshotInode), m.xattrKey(root)))
 }
 
+// dirMtimeWindow reports skip unchanged: a write here checks the elapsed time
+// against SkipDirMtime directly, with no retry-based scaling.
+func (m *redisMeta) dirMtimeWindow(skip time.Duration) time.Duration {
+	return skip
+}
+
 func (m *redisMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
 	return errno(m.rdb.ZAddXX(ctx, m.detachedNodes(), redis.Z{Member: inode.String(), Score: float64(time.Now().Unix())}).Err())
 }

@@ -1096,6 +1096,10 @@ func (m *kvMeta) shouldRetry(err error) bool {
 	return m.client.shouldRetry(err)
 }
 
+// kvTxnMaxRetry is how many times txn tries its callback by default; a caller
+// can lower it with txMaxRetryKey, never raise it.
+const kvTxnMaxRetry = 50
+
 func (m *kvMeta) txn(ctx Context, f func(tx *kvTxn) error, inodes ...Ino) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -1108,7 +1112,7 @@ func (m *kvMeta) txn(ctx Context, f func(tx *kvTxn) error, inodes ...Ino) error 
 		method  txMethod
 	)
 
-	maxRetry := 50
+	maxRetry := kvTxnMaxRetry
 	if val := ctx.Value(txMaxRetryKey{}); val != nil {
 		maxRetry = val.(int)
 	}
@@ -4973,6 +4977,14 @@ func (m *kvMeta) doSnapshotHold(ctx Context, name, key string, value []byte, hol
 		tx.delete(k)
 		return nil
 	}, SnapshotInode))
+}
+
+// dirMtimeWindow scales skip up by the transaction retry bound: an entry
+// change checks the elapsed time against SkipDirMtime*(tx.retry+1), so a
+// retried write can still be skipped up to kvTxnMaxRetry times as long as
+// skip alone would allow.
+func (m *kvMeta) dirMtimeWindow(skip time.Duration) time.Duration {
+	return skip * kvTxnMaxRetry
 }
 
 func (m *kvMeta) doTouchDetachedNode(ctx Context, inode Ino) syscall.Errno {
