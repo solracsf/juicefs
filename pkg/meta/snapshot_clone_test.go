@@ -435,3 +435,33 @@ func TestCloneDeleteDuringCopy(t *testing.T) {
 		})
 	}
 }
+
+// The same deletion during a snapshot: a best-effort one keeps the siblings,
+// a consistent one takes the tree again rather than failing.
+func TestSnapshotDeleteDuringCopy(t *testing.T) {
+	for _, kind := range cloneTestEngines {
+		t.Run(kind, func(t *testing.T) {
+			w := &unlinkDuringBatch{}
+			m := newCloneTestMeta(t, kind, func(e engine) engine { w.engine = e; return w })
+			w.m = m
+			ctx := Background()
+
+			dir, sub := makeTreeWithVictims(t, m, "be")
+			w.arm(sub, "victim")
+			root, st := m.CreateSnapshot(ctx, dir, "be", true, nil, nil)
+			if st != 0 {
+				t.Fatalf("best-effort snapshot: %s", st)
+			}
+			copiedSub, _ := mustLookup(t, m, root, "sub")
+			checkCopiedDir(t, m, copiedSub, "sub", true)
+
+			dir, _ = makeTreeWithVictims(t, m, "c")
+			w.arm(dir, "victim")
+			root, st = m.CreateSnapshot(ctx, dir, "c", false, nil, nil)
+			if st != 0 {
+				t.Fatalf("consistent snapshot failed instead of trying again: %s", st)
+			}
+			checkCopiedDir(t, m, root, ".", true)
+		})
+	}
+}
