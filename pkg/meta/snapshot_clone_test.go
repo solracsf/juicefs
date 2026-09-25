@@ -260,3 +260,45 @@ func TestCloneCompactRace(t *testing.T) {
 	f2, _ := mustLookup(t, m, dir2, "f")
 	check(f2, ids, "the file in the copied directory")
 }
+
+// A slice that a file holds twice is referenced twice more by a copy of the
+// file, whether it is copied on its own or as part of a directory.
+func TestCloneDupSliceRefs(t *testing.T) {
+	for _, kind := range cloneTestEngines {
+		t.Run(kind, func(t *testing.T) {
+			m := newCloneTestMeta(t, kind, nil)
+			ctx := Background()
+			var dir, out, f Ino
+			if st := m.Mkdir(ctx, RootInode, "d", 0755, 022, 0, &dir, &Attr{}); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := m.Mkdir(ctx, RootInode, "out", 0755, 022, 0, &out, &Attr{}); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := m.Create(ctx, dir, "f", 0644, 022, 0, &f, &Attr{}); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			var id uint64
+			if st := m.NewSlice(ctx, &id); st != 0 {
+				t.Fatalf("new slice: %s", st)
+			}
+			if st := m.Write(ctx, f, 0, 0, Slice{Id: id, Size: 1000, Len: 1000}, time.Now()); st != 0 {
+				t.Fatalf("write: %s", st)
+			}
+			var copied uint64
+			if st := m.CopyFileRange(ctx, f, 0, f, ChunkSize, 1000, 0, &copied, nil); st != 0 {
+				t.Fatalf("copy file range: %s", st)
+			}
+			before := sliceRefCount(t, m, id, 1000)
+
+			mustClone(t, m, dir, f, out, "g")
+			if got := sliceRefCount(t, m, id, 1000); got-before != 2 {
+				t.Fatalf("slice %d appears twice in the copied file but its refs moved %d -> %d", id, before, got)
+			}
+			mustClone(t, m, RootInode, dir, RootInode, "d2")
+			if got := sliceRefCount(t, m, id, 1000); got-before != 4 {
+				t.Fatalf("slice %d appears twice in the copied directory but its refs moved %d -> %d", id, before+2, got)
+			}
+		})
+	}
+}

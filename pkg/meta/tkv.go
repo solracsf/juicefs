@@ -4646,21 +4646,24 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 						return true
 					})
 
-				refKeys := make([][]byte, 0, len(vals))
+				refCounts := make(map[string]int) // sliceKey -> delta
 				for indx := uint32(0); indx <= uint32(attr.Length/ChunkSize); indx++ {
 					if v, ok := vals[string(m.chunkKey(srcIno, indx))]; ok {
 						tx.set(m.chunkKey(ino, indx), v)
-						ss := readSliceBuf(v)
-						for _, s := range ss {
+						for _, s := range readSliceBuf(v) {
 							if s.id > 0 {
-								refKeys = append(refKeys, m.sliceKey(s.id, s.size))
+								refCounts[string(m.sliceKey(s.id, s.size))]++
 							}
 						}
 					}
 				}
+				refKeys := make([][]byte, 0, len(refCounts))
+				for k := range refCounts {
+					refKeys = append(refKeys, []byte(k))
+				}
 				refs := tx.gets(refKeys...)
-				for i := range refKeys {
-					tx.set(refKeys[i], packCounter(parseCounter(refs[i])+1))
+				for i, k := range refKeys {
+					tx.set(k, packCounter(parseCounter(refs[i])+int64(refCounts[string(k)])))
 				}
 			}
 		case TypeSymlink:
