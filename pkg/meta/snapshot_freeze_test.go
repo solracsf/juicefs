@@ -185,3 +185,37 @@ func TestSnapshotOpenCache(t *testing.T) {
 		}
 	}
 }
+
+// Only CreateSnapshot may build frozen trees: Clone refuses the snapshot mode.
+func TestSnapshotCloneMode(t *testing.T) {
+	for name, m := range snapshotFreezeMetas(t, nil, nil) {
+		ctx := Background()
+		var dir Ino
+		if st := m.Mkdir(ctx, RootInode, "d", 0777, 0, 0, &dir, &Attr{}); st != 0 {
+			t.Fatalf("%s: mkdir: %s", name, st)
+		}
+		if st := m.Create(ctx, dir, "f", 0644, 0, 0, new(Ino), &Attr{}); st != 0 {
+			t.Fatalf("%s: create: %s", name, st)
+		}
+		user := NewContext(2, 1000, []uint32{1000})
+		for _, c := range []Context{user, ctx} {
+			st := m.Clone(c, RootInode, dir, RootInode, "frozen", CLONE_MODE_SNAPSHOT, 022, 1, new(uint64), new(uint64))
+			if st != syscall.EINVAL {
+				t.Errorf("%s: clone with the snapshot mode by uid %d should be EINVAL, got %v", name, c.Uid(), st)
+			}
+			if st := m.Lookup(ctx, RootInode, "frozen", new(Ino), &Attr{}, false); st != syscall.ENOENT {
+				t.Errorf("%s: a refused clone left an entry behind: %v", name, st)
+			}
+		}
+		if st := m.Clone(ctx, RootInode, dir, RootInode, "copy", CLONE_MODE_PRESERVE_ATTR, 022, 1, new(uint64), new(uint64)); st != 0 {
+			t.Errorf("%s: plain clone: %v", name, st)
+		}
+		// snapshots are still frozen through the internal path
+		_, ssub, sfile := snapshotFreezeTree(t, m)
+		for _, ino := range []Ino{ssub, sfile} {
+			if got := rawAttr(t, m, ino).Flags; got&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable {
+				t.Errorf("%s: snapshot inode %d is not frozen: flags %d", name, ino, got)
+			}
+		}
+	}
+}

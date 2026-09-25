@@ -4077,8 +4077,14 @@ func (m *baseMeta) ScanDeletedObject(ctx Context, tss trashSliceScan, pss pendin
 	return eg.Wait()
 }
 
-func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
+// clonePublicModes are the clone modes a client may ask for. The snapshot mode
+// freezes the copies for good, so only CreateSnapshot uses it.
+const clonePublicModes = CLONE_MODE_CAN_OVERWRITE | CLONE_MODE_PRESERVE_ATTR | CLONE_MODE_PRESERVE_HARDLINKS
 
+func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
+	if cmode&^clonePublicModes != 0 {
+		return syscall.EINVAL
+	}
 	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || isReservedEntry(parent, name) || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
