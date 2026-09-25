@@ -5776,9 +5776,6 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 						}
 					case TypeSymlink:
 						scmds[ino] = readPipe.Get(ctx, m.symKey(ino))
-					default:
-						logger.Warnf("doBatchClone: unsupported type %d for inode %d, skipping", a.Typ, ino)
-						delete(srcData, ino)
 					}
 				}
 				if _, err := readPipe.Exec(ctx); err != nil && err != redis.Nil {

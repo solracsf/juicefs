@@ -302,3 +302,43 @@ func TestCloneDupSliceRefs(t *testing.T) {
 		})
 	}
 }
+
+// Every kind of non-directory entry is copied, including FIFOs, sockets and
+// devices, which keep their device numbers.
+func TestCloneSpecialFiles(t *testing.T) {
+	specials := []struct {
+		name string
+		typ  uint8
+		rdev uint32
+	}{
+		{"fifo", TypeFIFO, 0},
+		{"sock", TypeSocket, 0},
+		{"chr", TypeCharDev, 0x0501},
+		{"blk", TypeBlockDev, 0x0802},
+	}
+	for _, kind := range cloneTestEngines {
+		t.Run(kind, func(t *testing.T) {
+			m := newCloneTestMeta(t, kind, nil)
+			ctx := Background()
+			var dir, ino Ino
+			if st := m.Mkdir(ctx, RootInode, "sp", 0755, 022, 0, &dir, &Attr{}); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			for _, s := range specials {
+				if st := m.Mknod(ctx, dir, s.name, s.typ, 0644, 022, s.rdev, "", &ino, &Attr{}); st != 0 {
+					t.Fatalf("mknod %s: %s", s.name, st)
+				}
+			}
+			mustClone(t, m, RootInode, dir, RootInode, "sp2")
+			clone, _ := mustLookup(t, m, RootInode, "sp2")
+			for _, s := range specials {
+				var attr Attr
+				if st := m.Lookup(ctx, clone, s.name, &ino, &attr, false); st != 0 {
+					t.Errorf("the copy lost %s: %s", s.name, st)
+				} else if attr.Typ != s.typ || attr.Rdev != s.rdev {
+					t.Errorf("%s copied as type %d rdev %#x, want type %d rdev %#x", s.name, attr.Typ, attr.Rdev, s.typ, s.rdev)
+				}
+			}
+		})
+	}
+}
