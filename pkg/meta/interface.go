@@ -160,11 +160,20 @@ func (i Ino) IsNormal() bool {
 var TrashName = ".trash"
 var SnapshotName = ".snapshots"
 
-// isReservedEntry reports whether name is one of the hidden roots under the volume
-// root. They are resolved by Lookup rather than by a directory entry, so they must
-// never be created, renamed or removed through the normal namespace calls.
-func isReservedEntry(parent Ino, name string) bool {
-	return parent == RootInode && (name == TrashName || name == SnapshotName)
+// The hidden roots go by these names under the volume root, plain or prefixed
+// with .jfs by a mount with --prefix-internal. Each mount resolves one spelling
+// through Lookup rather than through a directory entry, so an entry made under
+// the other spelling would shadow or double the hidden root on those mounts.
+// Both spellings are therefore reserved, whatever this process calls them.
+// isReservedEntry (in base.go) reports whether a name under a parent is one of
+// them, so it must never be created, renamed or removed through the normal
+// namespace calls.
+func isTrashName(name string) bool {
+	return name == ".trash" || name == ".jfs.trash"
+}
+
+func isSnapshotName(name string) bool {
+	return name == ".snapshots" || name == ".jfs.snapshots"
 }
 
 type internalNode struct {

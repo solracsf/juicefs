@@ -1653,7 +1653,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	if parent.IsTrash() || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
-	if isReservedEntry(parent, name) {
+	if m.isReservedEntry(parent, name) {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1752,7 +1752,7 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 	if parent.IsTrash() || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
-	if isReservedEntry(parent, name) {
+	if m.isReservedEntry(parent, name) {
 		return syscall.EPERM
 	}
 	if m.conf.ReadOnly {
@@ -1949,7 +1949,7 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 }
 
 func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
-	if m.hidesEntry(ctx, parentSrc, nameSrc) || isReservedEntry(parentDst, nameDst) || parentSrc.IsSnapshot() || parentDst.IsSnapshot() {
+	if m.hidesEntry(ctx, parentSrc, nameSrc) || m.isReservedEntry(parentDst, nameDst) || parentSrc.IsSnapshot() || parentDst.IsSnapshot() {
 		return syscall.EPERM
 	}
 	if parentDst.IsTrash() || parentSrc.IsTrash() && ctx.Uid() != 0 {
@@ -3215,6 +3215,13 @@ func (m *baseMeta) ensureSnapshotRoot(ctx Context) syscall.Errno {
 	return m.en.doRepair(ctx, SnapshotInode, &attr, false)
 }
 
+// isReservedEntry reports whether name under parent is the name of a hidden root,
+// in either spelling, so it must never be created through the normal namespace
+// calls; hidesEntry says whether the name resolves to one here.
+func (m *baseMeta) isReservedEntry(parent Ino, name string) bool {
+	return parent == RootInode && (isTrashName(name) || isSnapshotName(name))
+}
+
 // hidesEntry reports whether name under parent is a hidden root that must not be
 // removed or renamed. A real /.snapshots from before snapshots existed is not
 // hidden until the snapshot root is created, so it can still be moved away.
@@ -4283,7 +4290,7 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 	if cmode&^clonePublicModes != 0 {
 		return syscall.EINVAL
 	}
-	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || isReservedEntry(parent, name) || parent.IsSnapshot() {
+	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || m.isReservedEntry(parent, name) || parent.IsSnapshot() {
 		return syscall.EPERM
 	}
 
