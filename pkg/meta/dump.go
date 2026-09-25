@@ -444,7 +444,93 @@ type chunkKey struct {
 	size uint32
 }
 
+// errSettingAfterEntries reports a dump whose entries come before its settings,
+// as one re-serialized with sorted keys does.
+var errSettingAfterEntries = errors.New("the entries come before 'Setting'")
+
+// loadEntries writes the entries of a JSON dump as it reads them, once the
+// settings of the dump have passed the version check: nothing is written from a
+// dump this client may not load. When the entries come before the settings,
+// which a dump written by JuiceFS never does, the settings are read and checked
+// in a pass of their own first, which needs the input read again: a plain file.
 func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey)) (dm *DumpedMeta,
+	counters *DumpedCounters, parents map[Ino][]Ino, refs map[chunkKey]int64, err error) {
+	dm, counters, parents, refs, err = readEntries(r, false, load, addChunk)
+	if !errors.Is(err, errSettingAfterEntries) {
+		return
+	}
+	rs, ok := r.(io.ReadSeeker)
+	if !ok {
+		err = fmt.Errorf("%s, so they must be checked first: load the dump from a plain JSON file, or move 'Setting' to its front", err)
+		return
+	}
+	if _, e := rs.Seek(0, io.SeekStart); e != nil {
+		err = fmt.Errorf("%s, so they must be checked first: load the dump from a plain JSON file, or move 'Setting' to its front (%s)", err, e)
+		return
+	}
+	format, e := readDumpSetting(rs)
+	if e == nil {
+		e = format.CheckVersion()
+	}
+	if e != nil {
+		err = fmt.Errorf("load Setting: %s", e)
+		return
+	}
+	if _, err = rs.Seek(0, io.SeekStart); err != nil {
+		return
+	}
+	return readEntries(rs, true, load, addChunk)
+}
+
+// readDumpSetting returns the settings of a JSON dump, reading past the other
+// keys without decoding them.
+func readDumpSetting(r io.Reader) (*Format, error) {
+	dec := json.NewDecoder(r)
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	for dec.More() {
+		name, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		if name == "Setting" {
+			var format Format
+			if err = dec.Decode(&format); err != nil {
+				return nil, err
+			}
+			return &format, nil
+		}
+		if err = skipValue(dec); err != nil {
+			return nil, err
+		}
+	}
+	return nil, errors.New("no 'Setting' in the dump")
+}
+
+// skipValue reads one JSON value, whatever its depth, without decoding it.
+func skipValue(dec *json.Decoder) error {
+	var depth int
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
+}
+
+func readEntries(r io.Reader, checked bool, load func(*DumpedEntry), addChunk func(*chunkKey)) (dm *DumpedMeta,
 	counters *DumpedCounters, parents map[Ino][]Ino, refs map[chunkKey]int64, err error) {
 	logger.Infoln("Loading from file ...")
 	dec := json.NewDecoder(r)
@@ -471,8 +557,9 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 		}
 		// entries are written as they are decoded: only a dump whose settings
 		// this client accepts may reach the first write
-		if !hasSetting && (name == "FSTree" || name == "Trash" || name == "Snapshots") {
-			err = fmt.Errorf("load %v: no 'Setting' before the entries", name)
+		if !checked && !hasSetting && (name == "FSTree" || name == "Trash" || name == "Snapshots") {
+			progress.Done()
+			err = fmt.Errorf("load %v: %w", name, errSettingAfterEntries)
 			return
 		}
 		switch name {

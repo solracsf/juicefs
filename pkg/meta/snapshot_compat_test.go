@@ -19,6 +19,7 @@ package meta
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"path"
 	"strings"
 	"syscall"
@@ -55,9 +56,9 @@ func compatFormat() *Format {
 	return f
 }
 
-// newCompatMeta opens an empty volume on the engine, formatted with
-// compatFormat, and closes it with the test.
-func newCompatMeta(t *testing.T, uri string) Meta {
+// emptyCompatMeta opens an empty, unformatted store on the engine and closes
+// it with the test.
+func emptyCompatMeta(t *testing.T, uri string) Meta {
 	t.Helper()
 	m := NewClient(uri, testConfig())
 	if err := m.Reset(); err != nil {
@@ -67,6 +68,14 @@ func newCompatMeta(t *testing.T, uri string) Meta {
 		_ = m.Reset()
 		_ = m.Shutdown()
 	})
+	return m
+}
+
+// newCompatMeta opens an empty volume on the engine, formatted with
+// compatFormat, and closes it with the test.
+func newCompatMeta(t *testing.T, uri string) Meta {
+	t.Helper()
+	m := emptyCompatMeta(t, uri)
 	if err := m.Init(compatFormat(), false); err != nil {
 		t.Fatalf("init %s: %s", uri, err)
 	}
@@ -477,6 +486,105 @@ func TestDumpRefusesSnapshotSubdir(t *testing.T) {
 			}
 			if dm.FSTree == nil || dm.FSTree.Entries["f"] == nil || dm.FSTree.Entries["f"].Attr.Flags&FlagSnapshot != 0 {
 				t.Fatalf("dump of a live directory: %+v", dm.FSTree)
+			}
+		})
+	}
+}
+
+// sortedDump re-serializes a JSON dump with its keys sorted, as a tool that
+// edits it may, which puts FSTree before Setting.
+func sortedDump(t *testing.T, dump []byte, edit func(map[string]json.RawMessage)) []byte {
+	t.Helper()
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(dump, &keys); err != nil {
+		t.Fatalf("parse the dump: %s", err)
+	}
+	if edit != nil {
+		edit(keys)
+	}
+	sorted, err := json.Marshal(keys)
+	if err != nil {
+		t.Fatalf("serialize the dump: %s", err)
+	}
+	if bytes.Index(sorted, []byte(`"FSTree"`)) > bytes.Index(sorted, []byte(`"Setting"`)) {
+		t.Fatalf("the sorted dump still has Setting before FSTree")
+	}
+	return sorted
+}
+
+// A JSON dump whose keys were reordered so that its entries come before its
+// settings loads from a plain file, checked before anything is written; from
+// a stream it is refused, since it cannot be checked first.
+func TestLoadReorderedDump(t *testing.T) {
+	for _, e := range compatEngines() {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := Background()
+			src := newCompatMeta(t, e.uri(t))
+			var dir, file Ino
+			if st := src.Mkdir(ctx, RootInode, "d", 0755, 0, 0, &dir, nil); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := src.Create(ctx, dir, "f", 0644, 0, 0, &file, nil); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			if st := src.Write(ctx, file, 0, 0, Slice{Id: 300001, Size: 100, Len: 100}, time.Now()); st != 0 {
+				t.Fatalf("write: %s", st)
+			}
+			if _, st := src.CreateSnapshot(ctx, dir, "s1", false, nil, nil); st != 0 {
+				t.Fatalf("create snapshot: %s", st)
+			}
+			var buf bytes.Buffer
+			if err := src.DumpMeta(&buf, RootInode, 1, true, false, false); err != nil {
+				t.Fatalf("dump: %s", err)
+			}
+			sorted := sortedDump(t, buf.Bytes(), nil)
+
+			// from a file: loaded whole
+			dst := emptyCompatMeta(t, e.uri(t))
+			if err := dst.LoadMeta(bytes.NewReader(sorted)); err != nil {
+				t.Fatalf("load the reordered dump: %s", err)
+			}
+			if f, err := dst.Load(true); err != nil || f.MetaVersion != 2 {
+				t.Fatalf("format after the load: %+v %v", f, err)
+			}
+			var got Ino
+			var attr Attr
+			if st := dst.Lookup(ctx, RootInode, "d", &got, &attr, false); st != 0 {
+				t.Fatalf("lookup d: %s", st)
+			}
+			if st := dst.Lookup(ctx, got, "f", &got, &attr, false); st != 0 || attr.Length != 100 {
+				t.Fatalf("lookup f: %v, length %d", st, attr.Length)
+			}
+			if st := dst.Lookup(ctx, SnapshotInode, "s1", &got, &attr, false); st != 0 || attr.Flags&FlagSnapshot == 0 {
+				t.Fatalf("lookup the snapshot: %v, flags %d", st, attr.Flags)
+			}
+
+			// from a stream: refused, and nothing written
+			dst = emptyCompatMeta(t, e.uri(t))
+			err := dst.LoadMeta(io.MultiReader(bytes.NewReader(sorted)))
+			if err == nil || !strings.Contains(err.Error(), "plain JSON file") {
+				t.Fatalf("load the reordered dump from a stream: %v, want a refusal", err)
+			}
+			if st := dst.getBase().en.doGetAttr(ctx, RootInode, &Attr{}); st == 0 {
+				t.Fatalf("a refused load wrote the root")
+			}
+
+			// from a file, for a newer client: refused, and nothing written
+			newer := sortedDump(t, buf.Bytes(), func(keys map[string]json.RawMessage) {
+				var f Format
+				if err := json.Unmarshal(keys["Setting"], &f); err != nil {
+					t.Fatalf("parse Setting: %s", err)
+				}
+				f.MetaVersion = MaxVersion + 1
+				keys["Setting"], _ = json.Marshal(&f)
+			})
+			dst = emptyCompatMeta(t, e.uri(t))
+			err = dst.LoadMeta(bytes.NewReader(newer))
+			if err == nil || !strings.Contains(err.Error(), "please upgrade the client") {
+				t.Fatalf("load a reordered dump for newer clients: %v, want a refusal", err)
+			}
+			if st := dst.getBase().en.doGetAttr(ctx, RootInode, &Attr{}); st == 0 {
+				t.Fatalf("a refused load wrote the root")
 			}
 		})
 	}
