@@ -81,15 +81,16 @@ objects(){
     find /var/jfs/myjfs/chunks -type f 2>/dev/null | wc -l
 }
 
+# make_tree ROOT [FILES]: 20 directories of FILES (40 by default) files each
 make_tree(){
     local root=$1
     mkdir -p $root
-    python3 - "$root" <<'EOF'
+    python3 - "$root" "${2:-40}" <<'EOF'
 import os, sys
 root = sys.argv[1]
 for d in range(20):
     os.makedirs(f"{root}/d{d}/sub", exist_ok=True)
-    for f in range(40):
+    for f in range(int(sys.argv[2])):
         with open(f"{root}/d{d}/f{f}", "wb") as fh:
             fh.write(os.urandom(4096 * (1 + f % 3)))
     os.setxattr(f"{root}/d{d}/f0", "user.tag", b"x")
@@ -450,23 +451,35 @@ test_snapshot_client_faults(){
 
 # The metadata engine stalls or drops off the network while a snapshot is taken:
 # the create either completes with a correct snapshot or fails leaving none. Each
-# create has to be held up by its fault, or the test proved nothing.
+# fault is injected once the create has started copying, which it shows by
+# registering the root it builds as a detached node, and each create has to be
+# held up by its fault, or the test proved nothing.
 test_snapshot_meta_faults(){
     [[ "$META" != "redis" ]] && echo "meta faults are injected into redis only, skipped" && return 0
     start_volume
-    make_tree /jfs/tree
+    # large enough for the copy to still be running when the fault lands
+    make_tree /jfs/tree 200
     $WL manifest /jfs/tree $T/live
+    local db=${META_URL##*/}; db=${db%%\?*}
     local n=0 faults="pause busy"
     command -v iptables > /dev/null && faults="$faults partition"
     for fault in $faults; do
         n=$((n + 1))
+        # a create that failed under the previous fault may have left its tree for gc
+        local before=$(redis-cli -n $db zcard detachedNodes)
         (
             local t0=$(date +%s%N) rc=0
             timeout 300 ./juicefs snapshot create $META_URL --path /tree --name f$n > $T/f$n.log 2>&1 || rc=$?
             echo "$rc $(( ($(date +%s%N) - t0) / 1000000 ))" > $T/f$n.rc
         ) &
         local job=$!
-        sleep 0.1
+        local started=0
+        for i in $(seq 1 200); do
+            [[ $(redis-cli -n $db zcard detachedNodes) -gt $before ]] && started=1 && break
+            kill -0 $job 2>/dev/null || break
+            sleep 0.05
+        done
+        [[ $started -eq 1 ]] || fail "the create under $fault never started copying, or finished first: the test proved nothing"
         case $fault in
             pause) redis-cli client pause 4000 ;;
             # a script that keeps the server busy, as a stalled engine would
@@ -579,16 +592,11 @@ test_snapshot_fsck(){
 # A client older than snapshots blocks the first one while it is mounted, and can
 # no longer mount, nor run gc, once a snapshot exists.
 test_snapshot_old_client(){
-    local url tag
-    url=$(curl -fsSL https://api.github.com/repos/juicedata/juicefs/releases 2>/dev/null | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    if r["tag_name"].startswith("v1.3."):
-        for a in r["assets"]:
-            if a["name"].endswith("-linux-amd64.tar.gz"):
-                print(a["browser_download_url"]); sys.exit()' 2>/dev/null) || true
-    [[ -z "$url" ]] && echo "no 1.3 release reachable, skipped" && return 0
-    mkdir -p /tmp/jfs-old && curl -fsSL "$url" | tar -xz -C /tmp/jfs-old juicefs
+    if ! old_client_download /tmp/jfs-old; then
+        [[ -n "$CI" ]] && fail "the 1.3 client could not be downloaded"
+        echo "no 1.3 release reachable, skipped"
+        return 0
+    fi
     # older clients do not know the client-cache options of META_URL
     local old_url=${META_URL%%\?*}
     start_volume
@@ -607,6 +615,26 @@ for r in json.load(sys.stdin):
     if /tmp/jfs-old/juicefs gc $old_url --delete; then
         fail "a pre-snapshot client ran gc on a volume with snapshots"
     fi
+}
+
+# old_client_download DIR: the latest 1.3 release, the last line before snapshots,
+# from the GitHub API, with GITHUB_TOKEN when set so that the rate limit of
+# unauthenticated calls does not stop it
+old_client_download(){
+    local dir=$1 url
+    local auth=()
+    [[ -n "$GITHUB_TOKEN" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    url=$(curl -fsSL "${auth[@]}" "https://api.github.com/repos/juicedata/juicefs/releases?per_page=100" | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    if r["tag_name"].startswith("v1.3.") and not r["prerelease"]:
+        for a in r["assets"]:
+            if a["name"].endswith("-linux-amd64.tar.gz"):
+                print(a["browser_download_url"]); sys.exit()') || return 1
+    [[ -n "$url" ]] || { echo "no 1.3 release listed"; return 1; }
+    echo "downloading the old client from $url"
+    mkdir -p $dir && curl -fsSL "$url" | tar -xz -C $dir juicefs || return 1
+    $dir/juicefs version
 }
 
 source .github/scripts/common/run_test.sh && run_test $@

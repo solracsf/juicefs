@@ -7,6 +7,7 @@ on:
       - 'release-**'
     paths:
       - '.github/scripts/command/*.sh'
+      - '.github/scripts/command/*.py'
       - '**/command.yml'
   pull_request:
     branches:
@@ -14,6 +15,7 @@ on:
       - 'release-**'
     paths:
       - '.github/scripts/command/*.sh'
+      - '.github/scripts/command/*.py'
       - '**/command.yml'
   schedule:
     - cron:  '30 20 * * *'
@@ -54,7 +56,7 @@ jobs:
       meta_matrix: ${{ steps.set-matrix.outputs.meta_matrix }}
 
   command_test1:
-    timeout-minutes: 60
+    timeout-minutes: 75
     needs: [build-matrix]
     strategy:
       fail-fast: false
@@ -130,9 +132,9 @@ jobs:
           sudo META=${{matrix.meta}} .github/scripts/command/clone.sh
 
       - name: Test Snapshot
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
-          sudo META=${{matrix.meta}} .github/scripts/command/snapshot.sh
+          sudo CI=true GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} META=${{matrix.meta}} .github/scripts/command/snapshot.sh
 
       - name: Test fsck
         timeout-minutes: 10
