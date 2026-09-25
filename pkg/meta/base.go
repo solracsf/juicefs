@@ -3515,6 +3515,21 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 			return 0, st
 		}
 		logger.Warnf("the tree changed while snapshot %s was taken, trying again (%d/%d)", name, i+1, attempts)
+		// a quiet directory touched just before this attempt started is not yet
+		// trusted (see (*snapshotBuild).trusts): its entries were listed less than
+		// a window past its own mtime, so a retry right away would find the same
+		// gap and fail again even though nothing is actually still changing.
+		// Sleeping the window clears that, but only up to what the default
+		// SkipDirMtime would give this engine (its own scaling included, see
+		// engine.dirMtimeWindow): that covers the common case, without making a
+		// retry wait out a much larger configured window. One still busy after
+		// it is presumably a tree that keeps changing, which the remaining
+		// attempts, and the docs, already expect to fail.
+		if !bestEffort {
+			if window, err := m.dirMtimeWindow(); err == nil {
+				time.Sleep(min(window, m.en.dirMtimeWindow(defaultSkipDirMtime)))
+			}
+		}
 	}
 }
 
@@ -3590,16 +3605,27 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 	return root, st
 }
 
+// defaultSkipDirMtime is the --skip-dir-mtime default every mount has run with
+// since the flag was added (see cmd/flags.go), so it is the skip a client may
+// be applying even when its session does not say so: one from before
+// SessionInfo.SkipDirMtime existed, or a writer such as `juicefs rmr`, `sync`
+// or the S3 gateway that never records a session at all. dirMtimeWindow floors
+// its window at this value for that reason, never at zero.
+const defaultSkipDirMtime = 100 * time.Millisecond
+
 // dirMtimeWindow is the longest span, across every session on the volume this
 // one included, during which a change to a directory's entries might leave its
 // mtime and ctime alone: each client may run with its own SkipDirMtime, and
-// engines may apply it differently (see engine.dirMtimeWindow).
+// engines may apply it differently (see engine.dirMtimeWindow). It is never
+// shorter than defaultSkipDirMtime or this client's own setting, since a
+// session recording no SkipDirMtime, or none at all, still means some client
+// may be skipping updates by the shared default.
 func (m *baseMeta) dirMtimeWindow() (time.Duration, error) {
 	sessions, err := m.en.ListSessions()
 	if err != nil {
 		return 0, err
 	}
-	skip := m.conf.SkipDirMtime
+	skip := max(m.conf.SkipDirMtime, defaultSkipDirMtime)
 	for _, s := range sessions {
 		skip = max(skip, s.SkipDirMtime)
 	}

@@ -193,10 +193,16 @@ func (h *afterListHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errn
 	return es, st
 }
 
-// TestSnapshotSkipDirMtime checks that a consistent snapshot is never
-// published in a state the source never had, when SkipDirMtime lets an entry
-// change leave the parent's mtime and ctime alone: the snapshot either fails
-// with EBUSY (retried by the caller) or matches the tree.
+// TestSnapshotSkipDirMtime checks that one build attempt (what CreateSnapshot
+// retries on EBUSY, see buildSnapshot) is never published in a state the
+// source never had, when SkipDirMtime lets an entry change leave the parent's
+// mtime and ctime alone: the attempt either fails with EBUSY or matches the
+// tree. It calls buildSnapshot directly, one attempt, rather than through
+// CreateSnapshot's retrying wrapper: a later attempt runs after the race
+// above has already played out once (its sync.Once fires only the first
+// time), so by then the source has genuinely settled into whatever it
+// injected, and a retry publishing that is matching the tree, not a bug this
+// test should catch.
 func TestSnapshotSkipDirMtime(t *testing.T) {
 	forSnapshotClients(t, func(t *testing.T, m Meta) {
 		ctx := Background()
@@ -207,9 +213,13 @@ func TestSnapshotSkipDirMtime(t *testing.T) {
 			src := snapshotMkdir(t, m, RootInode, name)
 			sub := snapshotMkdir(t, m, src, "sub")
 			z := snapshotCreate(t, m, sub, "z")
+			if st := base.ensureSnapshotRoot(ctx); st != 0 {
+				t.Fatalf("ensure snapshot root: %s", st)
+			}
 			orig := base.en
 			base.en = &skipMtimeEngine{engine: orig, m: m, src: src, sub: sub, z: z, created: make(chan struct{})}
-			root, st := m.CreateSnapshot(ctx, src, name, false, nil, nil)
+			count := new(uint64)
+			root, st := base.buildSnapshot(ctx, src, name, count, true)
 			base.en = orig
 			if st == syscall.EBUSY {
 				continue
@@ -248,6 +258,27 @@ func TestSnapshotSkipDirMtime(t *testing.T) {
 		}
 		if _, st := m.CreateSnapshot(ctx, src, "cold", false, nil, nil); st != 0 {
 			t.Fatalf("snapshot of a directory last changed three days ago: %s", st)
+		}
+	})
+}
+
+// TestSnapshotDirMtimeWindowFloor checks that dirMtimeWindow never returns
+// less than defaultSkipDirMtime, even when this client's own SkipDirMtime is
+// zero and every recorded session agrees: a writer that never records a
+// session at all (`juicefs rmr`, `sync`, the S3 gateway) or a session from
+// before SessionInfo.SkipDirMtime existed still ran with the shared default,
+// and treating either as zero would let CreateSnapshot trust a directory that
+// one of them could still be about to change without moving its mtime.
+func TestSnapshotDirMtimeWindowFloor(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		base := m.getBase()
+		base.conf.SkipDirMtime = 0 // as a sessionless writer like rmr or sync leaves it
+		window, err := base.dirMtimeWindow()
+		if err != nil {
+			t.Fatalf("dirMtimeWindow: %s", err)
+		}
+		if window < defaultSkipDirMtime {
+			t.Fatalf("dirMtimeWindow %s is below the default skip-dir-mtime %s", window, defaultSkipDirMtime)
 		}
 	})
 }
