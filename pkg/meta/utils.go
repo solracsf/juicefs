@@ -306,6 +306,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 		var wg sync.WaitGroup
 		var statusOnce sync.Once
 		var status syscall.Errno
+		var removed int64 // entries this pass actually got rid of
 		var nonDirEntries []*Entry
 		for i, e := range entries {
 			if e.Attr.Typ == TypeDirectory {
@@ -315,16 +316,22 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 					go func(child Ino, name string) {
 						defer wg.Done()
 						st := m.emptyEntry(ctx, inode, name, child, skipCheckTrash, count, concurrent)
-						if st != 0 && st != syscall.ENOENT {
+						if st == 0 {
+							atomic.AddInt64(&removed, 1)
+						} else if st != syscall.ENOENT {
 							statusOnce.Do(func() { status = st })
 						}
 						<-concurrent
 					}(e.Inode, string(e.Name))
 				default:
-					if st := m.emptyEntry(ctx, inode, string(e.Name), e.Inode, skipCheckTrash, count, concurrent); st != 0 && st != syscall.ENOENT {
+					st := m.emptyEntry(ctx, inode, string(e.Name), e.Inode, skipCheckTrash, count, concurrent)
+					if st != 0 && st != syscall.ENOENT {
 						ctx.Cancel()
 						wg.Wait()
 						return st
+					}
+					if st == 0 {
+						removed++
 					}
 				}
 			} else {
@@ -338,12 +345,23 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 		}
 		wg.Wait()
 
-		if status == 0 {
+		if status == 0 && len(nonDirEntries) > 0 {
 			status = m.BatchUnlink(ctx, inode, nonDirEntries, count, skipCheckTrash)
+			if status == 0 {
+				removed += int64(len(nonDirEntries))
+			}
 		}
 
 		if status != 0 || inode == TrashInode { // try only once for .trash
 			return status
+		}
+		if atomic.LoadInt64(&removed) == 0 {
+			// every entry in this pass came back ENOENT: its inode is already
+			// gone (e.g. a leaked-inode sweep raced with the copy that made it),
+			// so neither BatchUnlink nor Rmdir can ever remove the dangling link
+			// either, and another pass would only repeat the same failure
+			logger.Errorf("empty dir %d: %d entries are stuck, their inode is already gone", inode, len(entries))
+			return syscall.ENOENT
 		}
 	}
 }

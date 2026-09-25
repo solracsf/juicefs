@@ -350,3 +350,34 @@ func TestSnapshotLeakedSweepVsBuild(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotDanglingEntry checks that removing a tree with an entry whose
+// inode is already gone -- the state a wrongly-swept leaked inode leaves
+// behind -- fails instead of retrying forever.
+func TestSnapshotDanglingEntry(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		dir := snapshotMkdir(t, m, RootInode, "d")
+		sub := snapshotMkdir(t, m, dir, "sub")
+		snapshotCreate(t, m, sub, "f")
+		root, st := m.CreateSnapshot(ctx, dir, "s", false, nil, nil)
+		if st != 0 {
+			t.Fatalf("snapshot: %s", st)
+		}
+		var ssub Ino
+		if st := m.Lookup(ctx, root, "sub", &ssub, &Attr{}, false); st != 0 {
+			t.Fatalf("lookup: %s", st)
+		}
+		dropInode(t, m, ssub)
+		done := make(chan syscall.Errno, 1)
+		go func() { done <- m.DeleteSnapshot(ctx, "s", nil) }()
+		select {
+		case st := <-done:
+			if st == 0 {
+				t.Fatalf("deleting a snapshot with a dangling entry succeeded")
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("deleting a snapshot with a dangling entry did not return")
+		}
+	})
+}
