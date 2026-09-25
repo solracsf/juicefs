@@ -199,3 +199,36 @@ func TestSnapshotNameLimits(t *testing.T) {
 		}
 	})
 }
+
+// A quota cannot be set on a snapshot, nor on the snapshot root, and the error
+// says so rather than that the path does not exist.
+func TestSnapshotQuotaRefused(t *testing.T) {
+	forEachSurfaceMeta(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		var src, sub Ino
+		if st := m.Mkdir(ctx, RootInode, "src", 0755, 0, 0, &src, nil); st != 0 {
+			t.Fatalf("mkdir src: %s", st)
+		}
+		if st := m.Mkdir(ctx, src, "sub", 0755, 0, 0, &sub, nil); st != 0 {
+			t.Fatalf("mkdir src/sub: %s", st)
+		}
+		if _, st := m.CreateSnapshot(ctx, src, "s", false, nil, nil); st != 0 {
+			t.Fatalf("create snapshot: %s", st)
+		}
+		for _, p := range []string{"/" + SnapshotName, "/" + SnapshotName + "/s", "/" + SnapshotName + "/s/sub"} {
+			quotas := map[string]*Quota{p: {MaxSpace: 1 << 20}}
+			err := m.HandleQuota(ctx, QuotaSet, p, DirQuotaType, quotas, false, false, false)
+			if err == nil || err.Error() != "no quota for any snapshot" {
+				t.Fatalf("set a quota on %s: %v", p, err)
+			}
+			err = m.HandleQuota(ctx, QuotaSet, p, DirQuotaType, quotas, false, false, true)
+			if err == nil || err.Error() != "no quota for any snapshot" {
+				t.Fatalf("set a quota on %s, creating it: %v", p, err)
+			}
+		}
+		quotas := map[string]*Quota{"/src/sub": {MaxSpace: 1 << 20}}
+		if err := m.HandleQuota(ctx, QuotaSet, "/src/sub", DirQuotaType, quotas, false, false, false); err != nil {
+			t.Fatalf("set a quota on the live directory: %s", err)
+		}
+	})
+}

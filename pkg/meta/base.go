@@ -2900,7 +2900,14 @@ func (m *baseMeta) resolve(ctx Context, dpath string, inode *Ino, create bool) s
 	for dpath != "" {
 		ps := strings.SplitN(dpath, "/", 2)
 		if ps[0] != "" {
-			r := m.en.doLookup(ctx, *inode, ps[0], inode, &attr)
+			parent := *inode
+			r := m.en.doLookup(ctx, parent, ps[0], inode, &attr)
+			if errors.Is(r, syscall.ENOENT) && parent == RootInode && ps[0] == SnapshotName {
+				// the snapshot root has no directory entry
+				if r = m.en.doGetAttr(ctx, SnapshotInode, &attr); r == 0 {
+					*inode = SnapshotInode
+				}
+			}
 			if errors.Is(r, syscall.ENOENT) && create {
 				r = m.Mkdir(ctx, *inode, ps[0], 0777, uint16(umask), 0, inode, &attr)
 			}

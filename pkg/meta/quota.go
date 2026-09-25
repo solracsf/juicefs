@@ -596,6 +596,10 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32
 		if inode.IsTrash() {
 			return errors.New("no quota for any trash directory")
 		}
+		var attr Attr
+		if inode.IsSnapshot() || m.en.doGetAttr(ctx, inode, &attr) == 0 && attr.Flags&FlagSnapshot != 0 {
+			return errors.New("no quota for any snapshot")
+		}
 		key = uint64(inode)
 	} else if (qtype == UserQuotaType || qtype == GroupQuotaType) && cmd != QuotaCheck {
 		id, err := strconv.ParseUint(qkey, 10, 64)
