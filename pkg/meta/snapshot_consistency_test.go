@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -378,6 +379,34 @@ func TestSnapshotDanglingEntry(t *testing.T) {
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatalf("deleting a snapshot with a dangling entry did not return")
+		}
+	})
+}
+
+// TestSnapshotHoldPrefixCase checks that an ordinary extended attribute that
+// differs from the hold prefix only in case is never taken for a hold, on any
+// engine: SQLite and MySQL's default collation make SQL's LIKE
+// case-insensitive.
+func TestSnapshotHoldPrefixCase(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		dir := snapshotMkdir(t, m, RootInode, "d")
+		name := strings.ToUpper(snapshotHoldPrefix) + "x"
+		if st := m.SetXattr(ctx, dir, name, []byte("v"), 0); st != 0 {
+			t.Fatalf("setxattr %s: %s", name, st)
+		}
+		if _, st := m.CreateSnapshot(ctx, dir, "s", false, nil, nil); st != 0 {
+			t.Fatalf("snapshot: %s", st)
+		}
+		snaps, st := m.ListSnapshots(ctx)
+		if st != 0 || len(snaps) != 1 {
+			t.Fatalf("list: %v %s", snaps, st)
+		}
+		if len(snaps[0].Holds) != 0 {
+			t.Fatalf("a user attribute differing only in case is listed as a hold: %v", snaps[0].Holds)
+		}
+		if st := m.DeleteSnapshot(ctx, "s", nil); st != 0 {
+			t.Fatalf("delete a snapshot with no real hold: %s", st)
 		}
 	})
 }

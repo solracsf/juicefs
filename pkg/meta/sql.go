@@ -6007,12 +6007,18 @@ func (m *dbMeta) doDetachDirNode(ctx Context, parent Ino, inode Ino, name string
 		if !ok || e.Inode != inode {
 			return syscall.ENOENT
 		}
-		held, err := s.Where("inode = ? AND name LIKE ?", inode, snapshotHoldPrefix+"%").Count(&xattr{})
-		if err != nil {
+		// name LIKE is case-insensitive on SQLite and MySQL's default collation,
+		// so an ordinary attribute differing from the hold prefix only in case
+		// would count as a hold; filter the exact-case prefix in Go instead,
+		// which works the same on every SQL engine
+		var xs []xattr
+		if err = s.Cols("name").Where("inode = ?", inode).Find(&xs); err != nil {
 			return err
 		}
-		if held > 0 {
-			return syscall.EBUSY
+		for _, x := range xs {
+			if strings.HasPrefix(x.Name, snapshotHoldPrefix) {
+				return syscall.EBUSY
+			}
 		}
 		if err = deleteEdge(s, &e); err != nil {
 			return err
