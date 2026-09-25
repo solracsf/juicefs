@@ -3059,10 +3059,12 @@ func testOpenCache(t *testing.T, m Meta) {
 	ctx := Background()
 	var inode Ino
 	var attr = &Attr{}
-	if st := m.Create(ctx, 1, "f", 0644, 022, 0, &inode, attr); st != 0 {
+	// not "f": testAttrFlags leaves one behind that is immutable, and a cached open
+	// of it for writing is refused like any other
+	if st := m.Create(ctx, 1, "fOpenCache", 0644, 022, 0, &inode, attr); st != 0 {
 		t.Fatalf("create f: %s", st)
 	}
-	defer m.Unlink(ctx, 1, "f")
+	defer m.Unlink(ctx, 1, "fOpenCache")
 	if st := m.Open(ctx, inode, syscall.O_RDWR, attr); st != 0 {
 		t.Fatalf("open f: %s", st)
 	}

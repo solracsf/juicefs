@@ -2099,15 +2099,32 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 			m.touchAtime(ctx, inode, attr)
 		}
 	}()
+	if attr == nil {
+		attr = &Attr{}
+	}
 	if m.conf.OpenCache > 0 && m.of.OpenCheck(inode, attr) {
-		return 0
+		// the cached attributes still decide what this open may do
+		if st = m.checkOpen(ctx, inode, flags, attr); st != 0 {
+			m.of.Close(inode)
+		}
+		return
 	}
 	// attr may be valid, see fs.Open()
-	if attr != nil && !attr.Full {
+	if !attr.Full {
 		if st = m.GetAttr(ctx, inode, attr); st != 0 {
 			return
 		}
 	}
+	if st = m.checkOpen(ctx, inode, flags, attr); st != 0 {
+		return
+	}
+	m.of.Open(inode, attr)
+	return 0
+}
+
+// checkOpen decides whether the caller may open inode with flags, from its
+// permission bits and the attribute flags that restrict writing.
+func (m *baseMeta) checkOpen(ctx Context, inode Ino, flags uint32, attr *Attr) syscall.Errno {
 	var mmask uint8 = 0
 	switch flags & (syscall.O_RDONLY | syscall.O_WRONLY | syscall.O_RDWR) {
 	case syscall.O_RDONLY:
@@ -2121,8 +2138,8 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 	case syscall.O_RDWR:
 		mmask = MODE_MASK_R | MODE_MASK_W
 	}
-	if st = m.Access(ctx, inode, mmask, attr); st != 0 {
-		return
+	if st := m.Access(ctx, inode, mmask, attr); st != 0 {
+		return st
 	}
 
 	if attr.Flags&FlagImmutable != 0 || attr.Parent > TrashInode {
@@ -2138,7 +2155,6 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st sy
 			return syscall.EPERM
 		}
 	}
-	m.of.Open(inode, attr)
 	return 0
 }
 

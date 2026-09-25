@@ -146,3 +146,42 @@ func TestSnapshotWriteRefused(t *testing.T) {
 		}
 	}
 }
+
+// With the open cache on, a second open must still honor the freeze and the
+// permission bits, both of which the first open already checked.
+func TestSnapshotOpenCache(t *testing.T) {
+	conf := testConfig()
+	conf.OpenCache = time.Hour
+	for name, m := range snapshotFreezeMetas(t, conf, nil) {
+		_, _, sfile := snapshotFreezeTree(t, m)
+		user := NewContext(1, 1000, []uint32{1000})
+		var attr Attr
+		if st := m.Open(user, sfile, syscall.O_RDONLY, &attr); st != 0 {
+			t.Fatalf("%s: open snapshot file read-only: %s", name, st)
+		}
+		for _, ctx := range []Context{user, Background()} {
+			if st := m.Open(ctx, sfile, syscall.O_RDWR, &attr); st != syscall.EPERM {
+				t.Errorf("%s: cached open of a snapshot file for writing by uid %d should be EPERM, got %v", name, ctx.Uid(), st)
+			}
+		}
+		// a refused open holds no reference
+		if !m.getBase().of.Close(sfile) {
+			t.Errorf("%s: refused opens left references on the snapshot file", name)
+		}
+
+		var private Ino
+		if st := m.Create(user, RootInode, "private", 0600, 0, 0, &private, &Attr{}); st != 0 {
+			t.Fatalf("%s: create: %s", name, st)
+		}
+		if st := m.Open(user, private, syscall.O_RDWR, &attr); st != 0 {
+			t.Fatalf("%s: open own file: %s", name, st)
+		}
+		other := NewContext(2, 1001, []uint32{1001})
+		if st := m.Open(other, private, syscall.O_RDONLY, &attr); st != syscall.EACCES {
+			t.Errorf("%s: cached open of a 0600 file by another user should be EACCES, got %v", name, st)
+		}
+		if st := m.Open(user, private, syscall.O_RDWR, &attr); st != 0 {
+			t.Errorf("%s: second open of own file: %v", name, st)
+		}
+	}
+}
