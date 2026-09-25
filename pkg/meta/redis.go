@@ -3144,7 +3144,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 			return err
 		}
 		m.parseAttr(a, attr)
-		if attr.Typ != TypeFile {
+		if attr.Typ != TypeFile || attr.Flags&FlagImmutable != 0 {
 			return syscall.EPERM
 		}
 		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)

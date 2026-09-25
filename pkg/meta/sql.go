@@ -3467,7 +3467,7 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		if !ok {
 			return syscall.ENOENT
 		}
-		if nodeAttr.Type != TypeFile {
+		if nodeAttr.Type != TypeFile || nodeAttr.Flags&FlagImmutable != 0 {
 			return syscall.EPERM
 		}
 		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)

@@ -2697,7 +2697,7 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 			return syscall.ENOENT
 		}
 		m.parseAttr(rs[0], attr)
-		if attr.Typ != TypeFile {
+		if attr.Typ != TypeFile || attr.Flags&FlagImmutable != 0 {
 			return syscall.EPERM
 		}
 		if len(rs[1])%sliceBytes != 0 {
