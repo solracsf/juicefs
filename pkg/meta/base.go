@@ -3406,10 +3406,14 @@ func (m *baseMeta) CreateSnapshot(ctx Context, src Ino, name string, bestEffort 
 	if m.conf.ReadOnly {
 		return 0, syscall.EROFS
 	}
+	// a directory name, and one that "snapshot list" can print on a line
+	if len(name) > MaxName {
+		return 0, syscall.ENAMETOOLONG
+	}
 	if st := checkInodeName(name); st != 0 {
 		return 0, st
 	}
-	if name == "." || name == ".." {
+	if name == "." || name == ".." || strings.ContainsFunc(name, unicode.IsControl) {
 		return 0, syscall.EINVAL
 	}
 	src = m.checkRoot(src)

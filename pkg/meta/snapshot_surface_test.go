@@ -18,6 +18,7 @@ package meta
 
 import (
 	"path"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -164,6 +165,37 @@ func TestSnapshotReservedAtVolumeRootOnly(t *testing.T) {
 		base.chroot(RootInode)
 		if st := m.Lookup(ctx, SnapshotInode, "s", &ino, &Attr{}, false); st != 0 {
 			t.Fatalf("the snapshot is gone: %s", st)
+		}
+	})
+}
+
+// A snapshot name is a directory name: at most MaxName bytes, and without the
+// control characters that would break the listing.
+func TestSnapshotNameLimits(t *testing.T) {
+	forEachSurfaceMeta(t, func(t *testing.T, m Meta) {
+		ctx := Background()
+		var src Ino
+		if st := m.Mkdir(ctx, RootInode, "src", 0755, 0, 0, &src, nil); st != 0 {
+			t.Fatalf("mkdir src: %s", st)
+		}
+		if _, st := m.CreateSnapshot(ctx, src, strings.Repeat("n", MaxName+1), false, nil, nil); st != syscall.ENAMETOOLONG {
+			t.Fatalf("snapshot with a %d-byte name: %s, want ENAMETOOLONG", MaxName+1, st)
+		}
+		for _, name := range []string{"a\nb", "a\tb", "a\x7fb", "\x01"} {
+			if _, st := m.CreateSnapshot(ctx, src, name, false, nil, nil); st != syscall.EINVAL {
+				t.Fatalf("snapshot named %q: %s, want EINVAL", name, st)
+			}
+		}
+		snaps, st := m.ListSnapshots(ctx)
+		if st != 0 || len(snaps) != 0 {
+			t.Fatalf("snapshots after refused names: %v %s", snaps, st)
+		}
+		longest := strings.Repeat("n", MaxName)
+		if _, st := m.CreateSnapshot(ctx, src, longest, false, nil, nil); st != 0 {
+			t.Fatalf("snapshot with a %d-byte name: %s", MaxName, st)
+		}
+		if _, st := m.CreateSnapshot(ctx, src, "été ok", false, nil, nil); st != 0 {
+			t.Fatalf("snapshot with a unicode name: %s", st)
 		}
 	})
 }
