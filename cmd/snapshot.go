@@ -243,8 +243,13 @@ func snapshotDelete(c *cli.Context) error {
 	chunkConf := *getDefaultChunkConf(format)
 	chunkConf.CacheDir = "memory"
 	store := chunk.NewCachedStore(blob, chunkConf, nil)
+	var failedSlices uint64
 	m.OnMsg(meta.DeleteSlice, func(args ...any) error {
-		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
+		err := store.Remove(args[0].(uint64), int(args[1].(uint32)))
+		if err != nil {
+			atomic.AddUint64(&failedSlices, 1)
+		}
+		return err
 	})
 
 	progress := utils.NewProgress(false)
@@ -273,6 +278,9 @@ func snapshotDelete(c *cli.Context) error {
 	}
 	if st != 0 {
 		return fmt.Errorf("delete snapshot %s: %s", name, st)
+	}
+	if n := atomic.LoadUint64(&failedSlices); n > 0 {
+		return fmt.Errorf("snapshot %s deleted (%d entries), but %d data blocks could not be removed from storage; `juicefs gc` will reclaim them", name, count, n)
 	}
 	logger.Infof("snapshot %s deleted (%d entries)", name, count)
 	return nil
