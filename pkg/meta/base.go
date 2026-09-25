@@ -3496,9 +3496,10 @@ func (m *baseMeta) buildSnapshot(ctx Context, src Ino, name string, count *uint6
 }
 
 // snapshotMatches reports whether the snapshot tree at dst still holds what the
-// live tree at src holds: the same entries, attributes and extended attributes.
-// Access times and link counts are left out: reads move the former, and the
-// latter only count the links a snapshot copies.
+// live tree at src holds: the same entries, attributes and extended attributes,
+// and the same files behind the names of hard links. Access times and link
+// counts are left out: reads move the former, and the latter only count the
+// links a snapshot copies.
 func (m *baseMeta) snapshotMatches(ctx Context, src, dst Ino) (bool, syscall.Errno) {
 	var sa, da Attr
 	if st := m.en.doGetAttr(ctx, src, &sa); st != 0 {
@@ -3510,9 +3511,41 @@ func (m *baseMeta) snapshotMatches(ctx Context, src, dst Ino) (bool, syscall.Err
 	if st := m.en.doGetAttr(ctx, dst, &da); st != 0 {
 		return false, st
 	}
-	var differs atomic.Bool
-	st := m.snapshotEntryMatches(ctx, src, dst, &sa, &da, &differs, make(chan struct{}, CLONE_DEFAULT_CONCURRENCY))
-	return st == 0 && !differs.Load(), st
+	c := &snapshotCheck{
+		concurrent: make(chan struct{}, CLONE_DEFAULT_CONCURRENCY),
+		copies:     make(map[Ino]Ino),
+		sources:    make(map[Ino]Ino),
+	}
+	st := m.snapshotEntryMatches(ctx, src, dst, &sa, &da, c)
+	return st == 0 && !c.differs.Load(), st
+}
+
+// snapshotCheck is the state of one comparison of a live tree with its copy.
+type snapshotCheck struct {
+	differs    atomic.Bool
+	concurrent chan struct{}
+	sync.Mutex
+	// the copy of each hard-linked file met so far, and the file behind each
+	// copy, so a file whose names ended up on two copies, or two files on one
+	// copy, is caught
+	copies  map[Ino]Ino
+	sources map[Ino]Ino
+}
+
+// sameLink records that dst is the copy of src and reports whether that
+// agrees with the links seen so far.
+func (c *snapshotCheck) sameLink(src, dst Ino) bool {
+	c.Lock()
+	defer c.Unlock()
+	if d, ok := c.copies[src]; ok && d != dst {
+		return false
+	}
+	if s, ok := c.sources[dst]; ok && s != src {
+		return false
+	}
+	c.copies[src] = dst
+	c.sources[dst] = src
+	return true
 }
 
 func snapshotAttrMatches(s, d *Attr) bool {
@@ -3522,12 +3555,18 @@ func snapshotAttrMatches(s, d *Attr) bool {
 		s.AccessACL == d.AccessACL && s.DefaultACL == d.DefaultACL
 }
 
-func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr, differs *atomic.Bool, concurrent chan struct{}) syscall.Errno {
-	if differs.Load() {
+func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr, c *snapshotCheck) syscall.Errno {
+	if c.differs.Load() {
 		return 0
 	}
 	if !snapshotAttrMatches(sa, da) {
-		differs.Store(true)
+		c.differs.Store(true)
+		return 0
+	}
+	// a link made during the copy can leave one file as two copies, and the
+	// attributes of both still match the file
+	if sa.Typ != TypeDirectory && (sa.Nlink > 1 || da.Nlink > 1) && !c.sameLink(src, dst) {
+		c.differs.Store(true)
 		return 0
 	}
 	sx, st := m.en.doGetXattrs(ctx, src)
@@ -3547,12 +3586,12 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 		}
 	}
 	if len(sx) != len(dx) {
-		differs.Store(true)
+		c.differs.Store(true)
 		return 0
 	}
 	for k, v := range sx {
 		if w, ok := dx[k]; !ok || !bytes.Equal(v, w) {
-			differs.Store(true)
+			c.differs.Store(true)
 			return 0
 		}
 	}
@@ -3567,17 +3606,17 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 	}
 	var g errgroup.Group
 	st = m.listDir(ctx, src, func(e *Entry) {
-		if differs.Load() {
+		if c.differs.Load() {
 			return
 		}
 		d, ok := copied[string(e.Name)]
 		if !ok {
-			differs.Store(true)
+			c.differs.Store(true)
 			return
 		}
 		delete(copied, string(e.Name))
 		check := func() error {
-			if st := m.snapshotEntryMatches(ctx, e.Inode, d.Inode, e.Attr, d.Attr, differs, concurrent); st != 0 {
+			if st := m.snapshotEntryMatches(ctx, e.Inode, d.Inode, e.Attr, d.Attr, c); st != 0 {
 				return st
 			}
 			return nil
@@ -3587,9 +3626,9 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 			return
 		}
 		select {
-		case concurrent <- struct{}{}:
+		case c.concurrent <- struct{}{}:
 			g.Go(func() error {
-				defer func() { <-concurrent }()
+				defer func() { <-c.concurrent }()
 				return check()
 			})
 		default:
@@ -3603,11 +3642,11 @@ func (m *baseMeta) snapshotEntryMatches(ctx Context, src, dst Ino, sa, da *Attr,
 	}
 	if st == syscall.ENOENT {
 		// the live directory went away
-		differs.Store(true)
+		c.differs.Store(true)
 		return 0
 	}
 	if len(copied) > 0 {
-		differs.Store(true)
+		c.differs.Store(true)
 	}
 	return st
 }

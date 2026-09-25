@@ -465,3 +465,70 @@ func TestSnapshotDeleteDuringCopy(t *testing.T) {
 		})
 	}
 }
+
+// linkDuringCopy holds the copy of directory z until a link to file a is
+// added under it, after a has been listed as a file with one link.
+type linkDuringCopy struct {
+	engine
+	m      Meta
+	a, z   Ino
+	linked chan struct{}
+	once   sync.Once
+}
+
+func (e *linkDuringCopy) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, attr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
+	if srcIno == e.z {
+		<-e.linked
+	}
+	return e.engine.doCloneEntry(ctx, srcIno, parent, name, ino, attr, cmode, cumask, top)
+}
+
+func (e *linkDuringCopy) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
+	for _, en := range entries {
+		if en.Inode == e.a {
+			e.once.Do(func() {
+				if st := e.m.Link(Background(), e.a, e.z, "b", &Attr{}); st != 0 {
+					panic(st)
+				}
+				close(e.linked)
+			})
+		}
+	}
+	return e.engine.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, result)
+}
+
+// A link made while the tree is copied must not leave one file as two copies.
+func TestSnapshotLinkSplit(t *testing.T) {
+	for _, kind := range cloneTestEngines {
+		t.Run(kind, func(t *testing.T) {
+			w := &linkDuringCopy{linked: make(chan struct{})}
+			m := newCloneTestMeta(t, kind, func(e engine) engine { w.engine = e; return w })
+			w.m = m
+			ctx := Background()
+			var dir, z, a Ino
+			if st := m.Mkdir(ctx, RootInode, "ls", 0755, 022, 0, &dir, &Attr{}); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := m.Create(ctx, dir, "a", 0644, 022, 0, &a, &Attr{}); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			if st := m.Mkdir(ctx, dir, "z", 0755, 022, 0, &z, &Attr{}); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			w.a, w.z = a, z
+			root, st := m.CreateSnapshot(ctx, dir, "s", false, nil, nil)
+			if st != 0 {
+				t.Fatalf("snapshot: %s", st)
+			}
+			sa, at := mustLookup(t, m, root, "a")
+			sz, _ := mustLookup(t, m, root, "z")
+			sb, bt := mustLookup(t, m, sz, "b")
+			if sa != sb {
+				t.Fatalf("a and z/b are one file, the snapshot holds two: %d (nlink %d) and %d (nlink %d)", sa, at.Nlink, sb, bt.Nlink)
+			}
+			if at.Nlink != 2 {
+				t.Fatalf("the snapshot copy has nlink %d, want 2", at.Nlink)
+			}
+		})
+	}
+}
