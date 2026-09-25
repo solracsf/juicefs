@@ -45,6 +45,24 @@ func TestArgsOrder(t *testing.T) {
 					},
 				},
 			},
+			{
+				Name: "parent",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name: "p",
+					},
+				},
+				Subcommands: []*cli.Command{
+					{
+						Name: "sub",
+						Flags: []cli.Flag{
+							&cli.StringFlag{
+								Name: "s",
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -53,6 +71,11 @@ func TestArgsOrder(t *testing.T) {
 		{"test", "--v", "cmd", "-k2", "v2", "a", "b"},
 		{"test", "cmd", "a", "-k2=v", "--h"},
 		{"test", "cmd", "-k2=v", "--h", "a"},
+		// the flags of a subcommand follow its name, those of its parent go before it
+		{"test", "parent", "sub", "a", "--s", "v", "--p", "b"},
+		{"test", "parent", "--p", "sub", "--s", "v", "a", "b"},
+		{"test", "parent", "--p", "sub", "-s=v", "a"},
+		{"test", "parent", "--p", "sub", "-s=v", "a"},
 	}
 	for i := 0; i < len(cases); i += 2 {
 		oreded := reorderOptions(app, cases[i])

@@ -253,20 +253,41 @@ func reorderOptions(app *cli.App, args []string) []string {
 	args, others = others[1:], nil
 	// -h is valid for all the commands
 	cmdFlags := append(cmd.Flags, cli.HelpFlag)
+	// the first argument of a command with subcommands names one; the flags of
+	// that subcommand are only known to it, so they go right after its name
+	var sub *cli.Command
+	var subArgs []string
 	for i := 0; i < len(args); i++ {
 		option := args[i]
-		if ok, hasValue := isFlag(cmdFlags, option); ok {
-			newArgs = append(newArgs, option)
+		flags, dst := cmdFlags, &newArgs
+		if ok, _ := isFlag(cmdFlags, option); !ok && sub != nil {
+			flags, dst = sub.Flags, &subArgs
+		}
+		if ok, hasValue := isFlag(flags, option); ok {
+			*dst = append(*dst, option)
 			if hasValue && len(args[i+1:]) > 0 {
 				i++
-				newArgs = append(newArgs, args[i])
+				*dst = append(*dst, args[i])
 			}
 		} else {
 			if strings.HasPrefix(option, "-") && !utils.StringContains(args, "--generate-bash-completion") {
 				logger.Fatalf("unknown option: %q", option)
 			}
+			if len(others) == 0 {
+				for _, c := range cmd.Subcommands {
+					if c.HasName(option) {
+						sub = c
+						break
+					}
+				}
+			}
 			others = append(others, option)
 		}
+	}
+	if sub != nil {
+		newArgs = append(newArgs, others[0])
+		newArgs = append(newArgs, subArgs...)
+		others = others[1:]
 	}
 	return append(newArgs, others...)
 }

@@ -72,31 +72,24 @@ $ juicefs snapshot release redis://localhost --name before-upgrade --tag backup-
 # Delete one, releasing the data only it referenced
 $ juicefs snapshot delete redis://localhost --name before-upgrade`,
 		HideHelpCommand: true,
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:  "path",
-				Value: "/",
-				Usage: "the directory to snapshot, relative to the volume root",
-			},
-			&cli.StringFlag{
-				Name:  "name",
-				Usage: "name of the snapshot",
-			},
-			&cli.BoolFlag{
-				Name:  "best-effort",
-				Usage: "keep the copy even if the tree changes while it is taken (create only)",
-			},
-			&cli.StringFlag{
-				Name:  "tag",
-				Usage: "name of the hold (hold and release only)",
-			},
-		},
 		Subcommands: []*cli.Command{
 			{
 				Name:      "create",
 				Usage:     "Create a snapshot of a directory tree",
 				ArgsUsage: "META-URL",
 				Action:    snapshotCreate,
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "path",
+						Value: "/",
+						Usage: "the directory to snapshot, relative to the volume root",
+					},
+					snapshotNameFlag(),
+					&cli.BoolFlag{
+						Name:  "best-effort",
+						Usage: "keep the copy even if the tree changes while it is taken",
+					},
+				},
 			},
 			{
 				Name:      "list",
@@ -109,20 +102,37 @@ $ juicefs snapshot delete redis://localhost --name before-upgrade`,
 				Usage:     "Delete a snapshot and release the data only it referenced",
 				ArgsUsage: "META-URL",
 				Action:    snapshotDelete,
+				Flags:     []cli.Flag{snapshotNameFlag()},
 			},
 			{
 				Name:      "hold",
 				Usage:     "Keep a snapshot from being deleted until the hold is released",
 				ArgsUsage: "META-URL",
 				Action:    func(c *cli.Context) error { return holdOrRelease(c, true) },
+				Flags:     []cli.Flag{snapshotNameFlag(), holdTagFlag()},
 			},
 			{
 				Name:      "release",
 				Usage:     "Release a hold on a snapshot",
 				ArgsUsage: "META-URL",
 				Action:    func(c *cli.Context) error { return holdOrRelease(c, false) },
+				Flags:     []cli.Flag{snapshotNameFlag(), holdTagFlag()},
 			},
 		},
+	}
+}
+
+func snapshotNameFlag() cli.Flag {
+	return &cli.StringFlag{
+		Name:  "name",
+		Usage: "name of the snapshot",
+	}
+}
+
+func holdTagFlag() cli.Flag {
+	return &cli.StringFlag{
+		Name:  "tag",
+		Usage: "name of the hold",
 	}
 }
 
