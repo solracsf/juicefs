@@ -684,7 +684,7 @@ juicefs mount redis://localhost /mnt/jfs --backup-meta 0
 |`MOUNTPOINT`|file system mount point, e.g. `/mnt/jfs`, `Z:`.|
 |`-d, --background`|run in background (default: false)|
 |`--no-syslog`|disable syslog (default: false)|
-|`--hide-internal` <VersionAdd>1.4</VersionAdd> |hide all internal files (`.accesslog`, `.stats`, `.config`, `.control`) from directory listings, these files are still accessible via their full path (default: false)|
+|`--hide-internal` <VersionAdd>1.4</VersionAdd> |hide all internal files (`.accesslog`, `.stats`, `.config`, `.control`) and the `.trash` and `.snapshots` directories from directory listings, they are still accessible via their full path (default: false)|
 |`--log=path`|path of log file when running in background (default: `$HOME/.juicefs/juicefs.log` or `/var/log/juicefs.log`)|
 |`--force`|force to mount even if the mount point is already mounted by the same filesystem.|
 |`--update-fstab` <VersionAdd>1.1</VersionAdd> |add / update entry in `/etc/fstab`, will create a symlink from `/sbin/mount.juicefs` to JuiceFS executable if not existing (default: false)|
@@ -701,7 +701,7 @@ juicefs mount redis://localhost /mnt/jfs --backup-meta 0
 |`--root-squash value` <VersionAdd>1.1</VersionAdd> |mapping local root user (UID = 0) to another one specified as UID:GID|
 |`--all-squash value` <VersionAdd>1.3</VersionAdd> |mapping all users to another one specified as UID:GID|
 |`--umask value` <VersionAdd>1.3</VersionAdd> |umask for new file and directory in octal|
-|`--prefix-internal` <VersionAdd>1.1</VersionAdd> |add '.jfs' prefix to all internal files (default: false)|
+|`--prefix-internal` <VersionAdd>1.1</VersionAdd> |add '.jfs' prefix to all internal files, and to the `.trash` and `.snapshots` directories (default: false)|
 |`--max-fuse-io=128K` <VersionAdd>1.3</VersionAdd>|maximum size for fuse request (default: 128K)|
 |`-o value`|other FUSE options, see [FUSE Mount Options](../reference/fuse_mount_options.md)|
 
@@ -1091,6 +1091,8 @@ juicefs clone -p /mnt/jfs/file1 /mnt/jfs/file2
 
 Create, list, hold and delete read-only snapshots of directories. A snapshot copies metadata only and is kept under `/.snapshots`. Read [Snapshots](../guide/snapshot.md) for more.
 
+`snapshot delete` deletes the blocks only that snapshot referenced from the object storage, so like [`juicefs gc`](#gc) it needs access to it: the credentials stored in the volume, and the `JFS_RSA_PASSPHRASE` environment variable when the private key of an encrypted volume has a passphrase. If some of those deletes fail, the command reports it and exits with an error, and a later `juicefs gc --delete` reclaims the blocks.
+
 #### Synopsis
 
 ```shell
@@ -1118,10 +1120,12 @@ juicefs snapshot release redis://localhost --name before-upgrade --tag backup-12
 
 |Items|Description|
 |-|-|
-|`--path value`|directory to snapshot, relative to the root of the volume (default: `/`); it cannot be in a snapshot, used by `create`|
-|`--name value`|name of the snapshot, used by `create`, `delete`, `hold` and `release`|
-|`--tag value`|name of the hold, used by `hold` and `release`: 1 to 200 bytes of UTF-8 without control characters|
-|`--best-effort`|keep the copy even if the tree changes while it is taken, so it may not be a point-in-time image (default: false), used by `create`|
+|`--path value`|directory to snapshot, relative to the root of the volume (default: `/`); it cannot be in a snapshot (`create` only)|
+|`--name value`|name of the snapshot, at most 255 bytes without control characters (`create`, `delete`, `hold` and `release`)|
+|`--tag value`|name of the hold, 1 to 200 bytes of UTF-8 without control characters (`hold` and `release` only)|
+|`--best-effort`|keep the copy even if the tree changes while it is taken, so it may not be a point-in-time image (default: false) (`create` only)|
+
+Each subcommand accepts its own options only.
 
 ### `juicefs compact` <VersionAdd>1.2</VersionAdd> {#compact}
 

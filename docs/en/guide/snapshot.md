@@ -1,6 +1,6 @@
 ---
 title: Snapshots
-sidebar_position: 7
+sidebar_position: 9
 description: Learn how to take read-only, metadata-only snapshots of JuiceFS directories, and how to list, read, restore from and delete them.
 ---
 
@@ -46,7 +46,7 @@ juicefs snapshot release redis://localhost --name before-upgrade --tag backup-12
 
 ## Read and restore {#read-and-restore}
 
-On a mount point, a snapshot appears as `/.snapshots/<name>` and can be read like any other directory. `.snapshots` is listed in the root of the volume once the first snapshot exists, the same way as `.trash`: the `--hide-internal` mount option hides it from listings, and `--prefix-internal` renames it to `.jfs.snapshots`. It is not visible on a mount of a subdirectory. A mount sees snapshots that `juicefs snapshot` creates or deletes as it sees any change made by another client, once its entry and attribute caches expire (1 second by default); until then, a snapshot created under the name of one just deleted may not be readable through that mount.
+On a mount point, a snapshot appears as `/.snapshots/<name>` and can be read like any other directory. `.snapshots` is listed in the root of the volume once the first snapshot exists, the same way as `.trash`: the `--hide-internal` mount option hides it from listings, and `--prefix-internal` renames it to `.jfs.snapshots`. Both names are reserved at the root of the volume on every mount, whichever it uses. It is not visible on a mount of a subdirectory. A mount sees snapshots that `juicefs snapshot` creates or deletes as it sees any change made by another client, once its entry and attribute caches expire (1 second by default); until then, a snapshot created under the name of one just deleted may not be readable through that mount.
 
 To restore files, copy them out of the snapshot. [`juicefs clone`](./clone.md) does it without copying any data, and the copy is an ordinary, writable file or directory:
 
@@ -56,8 +56,8 @@ juicefs clone /mnt/jfs/.snapshots/before-upgrade/config /mnt/jfs/config-restored
 
 ## Consistency {#consistency}
 
-- A snapshot becomes visible only once it is complete. A snapshot that fails is removed again at once; one whose creation was killed is removed by a later [`juicefs gc --delete`](../reference/command_reference.mdx#gc).
-- By default, a snapshot is published only once JuiceFS has validated that the tree did not change while it was copied: the tree is copied, the copy is compared with the live tree, and the snapshot is published only if they match. If anything changed, the copy is discarded and taken again, up to three times, and `juicefs snapshot create` fails with "device or resource busy" rather than publish a mixed tree. Take the snapshot when the tree is quieter, or stop writing to it while it is taken.
+- A snapshot becomes visible only once it is complete. A snapshot that fails is removed again at once; what a killed `juicefs snapshot create` left behind is removed by [`juicefs gc --delete`](../reference/command_reference.mdx#gc) once it is more than a day old.
+- By default, a snapshot is published only once JuiceFS has validated that the tree did not change while it was copied: the tree is copied, the copy is compared with the live tree, and the snapshot is published only if they match. If anything changed, the copy is discarded and tried again: the snapshot is tried up to three times, after which `juicefs snapshot create` fails with "device or resource busy" rather than publish a mixed tree. Take the snapshot when the tree is quieter, or stop writing to it while it is taken.
 - The comparison covers the namespace, file contents, inode attributes other than the access time, and extended attributes. It uses ctime as its change signal: every change a client makes sets the ctime of the file or directory it touches to the current time, so even a change undone before the comparison, such as a file renamed away and back, is seen. ctime is a timestamp taken from the writing client's clock, not a version counter, so a change that ends with the same values and the very same ctime as before, to the nanosecond, would not be seen. The comparison reads the live metadata, not a historical view of the metadata engine.
 - Access times are deliberately outside the comparison, since reads move them: the access time of an entry in a snapshot is the one its source had when it was copied, which may not match the other entries' instant, and reading the snapshot never updates it.
 - What validation proves is therefore limited to that scope: a published snapshot matches the tree, as JuiceFS's metadata holds it, in its namespace, file contents, attributes other than access times and extended attributes, at one instant between the copy and the comparison, barring a change that leaves the same ctime to the nanosecond. It says nothing about data not yet committed to the metadata engine, described below. This differs from OpenZFS, where a snapshot is taken atomically at a storage transaction boundary and includes every system call that completed before it.
@@ -71,9 +71,9 @@ juicefs clone /mnt/jfs/.snapshots/before-upgrade/config /mnt/jfs/config-restored
 
 A snapshot does not copy data, but it does copy metadata: every file and directory in the snapshot is an inode in the metadata engine, so a snapshot of a tree with a million files adds a million inodes and the matching metadata storage.
 
-Snapshots are not counted against the capacity or inode limits of the volume, nor against directory, user or group quotas, and `df` does not include them: snapshot metadata bypasses the inode and quota accounting altogether, so none of those limits stops a snapshot from being taken. Their usage is reported by `juicefs snapshot list` instead, as the number of inodes and the logical size of each snapshot. That size is the size of the files the snapshot holds; since those files share their blocks with the originals and with other snapshots, it is not the space that deleting the snapshot would free.
+Snapshots are not counted against the capacity or inode limits of the volume, nor against directory, user or group quotas, and `df` does not include them: snapshot metadata bypasses the inode and quota accounting altogether, so none of those limits stops a snapshot from being taken. Their usage is reported by `juicefs snapshot list` instead, as the number of inodes and the size of each snapshot. That size is counted as [`juicefs summary`](../reference/command_reference.mdx#summary) counts a directory, with every file rounded up to 4 KiB and 4 KiB per directory, so it is what the same tree costs against the capacity when it is live. Since the files of a snapshot share their blocks with the originals and with other snapshots, it is not the space that deleting the snapshot would free.
 
-While a snapshot exists, the blocks it references stay in object storage even after the original files are deleted. Deleting the snapshot removes its metadata and releases the blocks that no other file or snapshot references, before the command returns.
+While a snapshot exists, the blocks it references stay in object storage even after the original files are deleted. `juicefs snapshot delete` removes the metadata of the snapshot and deletes the blocks that no other file or snapshot references from the object storage before it returns, so like [`juicefs gc`](../reference/command_reference.mdx#gc) it needs access to the object storage: the credentials stored in the volume, and the `JFS_RSA_PASSPHRASE` environment variable when the private key of an encrypted volume has a passphrase. If the object storage refuses some of the deletes, the command reports it and exits with an error; the snapshot is gone all the same, and the blocks it left behind are reclaimed by a later `juicefs gc --delete`.
 
 The only built-in bound on snapshots is their number. To limit how much metadata snapshots can add, set how many snapshots a volume may hold:
 

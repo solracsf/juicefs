@@ -31,7 +31,7 @@ The table below provides a quick overview of the differences between GlusterFS a
 | POSIX ACLs | Supported | Supported |
 | Cross-cluster replication | Supported | Relies on external service |
 | Directory quotas | Supported | Supported |
-| Snapshots | Supported | Not supported (but supports cloning) |
+| Snapshots | Supported | Read-only directory snapshots (metadata only) and cloning |
 | Trash | Supported | Supported |
 | Primary maintainer | Red Hat, Inc | Juicedata, Inc |
 | Development language | C | Go |
@@ -167,7 +167,7 @@ Both [GlusterFS](https://docs.gluster.org/en/main/Administrator-Guide/Directory-
 
 GlusterFS supports [volume-level snapshots](https://docs.gluster.org/en/main/Administrator-Guide/Managing-Snapshots) and requires all bricks to be deployed on LVM thinly provisioned volumes.
 
-JuiceFS does not support snapshots but offers [directory-level cloning](../../guide/clone.md).
+JuiceFS takes [read-only snapshots](../../guide/snapshot.md) of directories: a snapshot copies metadata only and shares its data with the original, and it is not a volume-level snapshot of the storage. JuiceFS also offers [directory-level cloning](../../guide/clone.md).
 
 ### Trash {#trash}
 

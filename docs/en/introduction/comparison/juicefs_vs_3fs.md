@@ -108,7 +108,7 @@ The 3FS cache system consists of TLS (Thread-Local Storage) queues and global qu
 | Compression | Not supported | Supported | Supported |
 | Quota management | Not supported | Supported | Supported |
 | Network protocol | RDMA | TCP | TCP/RDMA |
-| Snapshots | Not supported | Supports cloning | Supports cloning |
+| Snapshots | Not supported | Read-only directory snapshots (metadata only) and cloning | Supports cloning |
 | POSIX ACL | Not supported | Supported | Supported |
 | POSIX compliance | Partial | Fully compatible | Fully compatible |
 | CSI Driver | No official support | Supported | Supported |
