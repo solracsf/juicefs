@@ -4466,9 +4466,13 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	// a snapshot is frozen for everyone, root included. FlagImmutable alone does
-	// not refuse attribute changes, and clearing it would let the data be rewritten
-	if cur.Flags&FlagSnapshot != 0 && dirtyAttr != *cur {
-		return nil, syscall.EPERM
+	// not refuse attribute changes, and clearing it would let the data be rewritten.
+	// A change to nothing is not written, or it would stamp a new ctime
+	if cur.Flags&FlagSnapshot != 0 {
+		if dirtyAttr != *cur {
+			return nil, syscall.EPERM
+		}
+		changed = false
 	}
 	if !changed {
 		*attr = *cur

@@ -282,3 +282,30 @@ func TestSnapshotCreateInside(t *testing.T) {
 		}
 	}
 }
+
+// A SetAttr that changes nothing on a frozen inode succeeds without touching it.
+func TestSnapshotNoopSetAttr(t *testing.T) {
+	for name, m := range snapshotFreezeMetas(t, nil, nil) {
+		ctx := Background()
+		_, ssub, sfile := snapshotFreezeTree(t, m)
+		for _, ino := range []Ino{ssub, sfile} {
+			before := rawAttr(t, m, ino)
+			time.Sleep(10 * time.Millisecond)
+			for set, same := range map[uint16]Attr{
+				SetAttrFlag: {Flags: before.Flags},
+				SetAttrTier: {Tier: before.Tier},
+				SetAttrMode: {Mode: before.Mode},
+			} {
+				if st := m.SetAttr(ctx, ino, set, 0, &same); st != 0 {
+					t.Errorf("%s: no-op setattr %d on snapshot inode %d: %v", name, set, ino, st)
+				}
+			}
+			if after := rawAttr(t, m, ino); after != before {
+				t.Errorf("%s: no-op setattr changed snapshot inode %d: %+v -> %+v", name, ino, before, after)
+			}
+			if st := m.SetAttr(ctx, ino, SetAttrMode, 0, &Attr{Mode: before.Mode ^ 0001}); st != syscall.EPERM {
+				t.Errorf("%s: chmod of snapshot inode %d should be EPERM, got %v", name, ino, st)
+			}
+		}
+	}
+}
