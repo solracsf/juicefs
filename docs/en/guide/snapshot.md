@@ -28,7 +28,7 @@ juicefs snapshot list redis://localhost
 juicefs snapshot delete redis://localhost --name before-upgrade
 ```
 
-`--path` is relative to the root of the volume. A snapshot name must be unique within the volume.
+`--path` is relative to the root of the volume. A snapshot name must be unique within the volume. `juicefs snapshot list` reports when each one was taken, alongside its holds, inode count and size; a snapshot taken before this was recorded shows the time its root was copied instead.
 
 Snapshots are taken of live files only. A directory that belongs to a snapshot, `/.snapshots` itself included, cannot be the source of another snapshot, whatever path leads to it: the check is made on the inode, not on the path. To snapshot what a snapshot holds, [clone](./clone.md) it out of the snapshot first.
 
