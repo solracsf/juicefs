@@ -410,3 +410,61 @@ func TestSnapshotHoldPrefixCase(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotConcurrentDeletes checks that several DeleteSnapshot calls
+// running at once in the same process all return, instead of each draining
+// the shared maxDeleting semaphore to its full capacity and deadlocking on
+// what the others already hold.
+func TestSnapshotConcurrentDeletes(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		if m.Name() == "redis" {
+			t.Skip("exercises the same code path as the other engines, much slower to set up here")
+		}
+		ctx := Background()
+		base := m.getBase()
+		m.OnMsg(DeleteSlice, func(args ...any) error { time.Sleep(time.Millisecond); return nil })
+		dir := snapshotMkdir(t, m, RootInode, "d")
+		nFiles := 2 * cap(base.maxDeleting)
+		for i := 0; i < nFiles; i++ {
+			f := snapshotCreate(t, m, dir, fmt.Sprintf("f%d", i))
+			var id uint64
+			m.NewSlice(ctx, &id)
+			if st := m.Write(ctx, f, 0, 0, Slice{Id: id, Size: 100, Len: 100}, time.Now()); st != 0 {
+				t.Fatalf("write: %s", st)
+			}
+		}
+		const n = 4
+		for i := 0; i < n; i++ {
+			if _, st := m.CreateSnapshot(ctx, dir, fmt.Sprintf("s%d", i), false, nil, nil); st != 0 {
+				t.Fatalf("snapshot: %s", st)
+			}
+		}
+		// unlink the live files too, so deleting each snapshot actually frees
+		// data instead of finding it still referenced elsewhere
+		for i := 0; i < nFiles; i++ {
+			if st := m.Unlink(ctx, dir, fmt.Sprintf("f%d", i)); st != 0 {
+				t.Fatalf("unlink: %s", st)
+			}
+		}
+		done := make(chan struct{})
+		go func() {
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					if st := m.DeleteSnapshot(ctx, fmt.Sprintf("s%d", i), nil); st != 0 {
+						t.Errorf("delete s%d: %s", i, st)
+					}
+				}(i)
+			}
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Minute):
+			t.Fatalf("concurrent DeleteSnapshot calls did not all return")
+		}
+	})
+}

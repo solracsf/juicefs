@@ -310,6 +310,7 @@ type baseMeta struct {
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
 	maxDeleting  chan struct{}
+	deleteWaitMu sync.Mutex // serializes DeleteSnapshot's drain of maxDeleting below
 	dslices      chan Slice // slices to delete
 	symlinks     *symlinkCache
 	msgCallbacks *msgCallbacks
@@ -3725,8 +3726,10 @@ func (m *baseMeta) listDir(ctx Context, ino Ino, fn func(*Entry)) syscall.Errno 
 
 // DeleteSnapshot removes the snapshot called name. Its root is detached first,
 // in one transaction, so a crash leaves a tree for gc to reap rather than half a
-// snapshot on view. The rest is removed here, so the slices it pinned are
-// released now rather than on some later gc run.
+// snapshot on view. The rest is removed here. When this client holds no
+// session, as the CLI does, the slices it pinned are released before this
+// returns; with a session, deleteSlice only queues their deletion, and a later
+// gc run finishes it.
 func (m *baseMeta) DeleteSnapshot(ctx Context, name string, count *uint64) syscall.Errno {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -3746,13 +3749,18 @@ func (m *baseMeta) DeleteSnapshot(ctx Context, name string, count *uint64) sysca
 		return st
 	}
 	// file data is removed in the background; wait for it, so the slices this
-	// snapshot alone held are gone when it returns
+	// snapshot alone held are gone when it returns. Draining maxDeleting to its
+	// full capacity only proves nothing is in flight once every slot is held at
+	// once, so two calls racing for all of it here would deadlock, each holding
+	// what the other needs; the mutex lets them take their turn instead.
+	m.deleteWaitMu.Lock()
 	for range cap(m.maxDeleting) {
 		m.maxDeleting <- struct{}{}
 	}
 	for range cap(m.maxDeleting) {
 		<-m.maxDeleting
 	}
+	m.deleteWaitMu.Unlock()
 	return 0
 }
 
