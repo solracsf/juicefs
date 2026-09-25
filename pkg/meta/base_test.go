@@ -5178,9 +5178,6 @@ func testSnapshotLeakedInodes(t *testing.T, m Meta) {
 	}
 }
 
-// Compacting a file merges its slices and drops the references the old ones
-// held. A snapshot shares those slices, so its own reference has to keep them
-// alive: without it the snapshot would still list slices whose data was freed.
 // testSnapshotConsistency checks the second pass of a snapshot: every kind of
 // change made to the tree after its copy must show up, and reads must not.
 func testSnapshotConsistency(t *testing.T, m Meta) {
@@ -5617,6 +5614,9 @@ func txRestarts(m Meta) float64 {
 	return n
 }
 
+// Compacting a file merges its slices and drops the references the old ones
+// held. A snapshot shares those slices, so its own reference has to keep them
+// alive: without it the snapshot would still list slices whose data was freed.
 func testSnapshotCompact(t *testing.T, m Meta) {
 	c, ok := m.(compactor)
 	if !ok {
