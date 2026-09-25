@@ -470,6 +470,9 @@ func format(c *cli.Context) error {
 	if v := c.Int("shards"); v > 256 {
 		logger.Fatalf("too many shards: %d", v)
 	}
+	if v := c.Int("max-snapshots"); v < 0 {
+		return fmt.Errorf("Invalid max snapshots: %d", v)
+	}
 
 	var create, encrypted bool
 	format, err := m.Load(false)

@@ -178,3 +178,26 @@ func TestFormatVersion(t *testing.T) {
 		t.Fatal("force bypassed incompatible metadata version")
 	}
 }
+
+func TestFormatMaxSnapshots(t *testing.T) {
+	metaURL := "sqlite3://" + filepath.Join(t.TempDir(), "test.db")
+	bucket := filepath.Join(t.TempDir(), "testBucket")
+	if err := Main([]string{"", "format", metaURL, "--bucket", bucket, "--max-snapshots", "-1", testVolume}); err == nil {
+		t.Fatalf("format with a negative --max-snapshots succeeded")
+	}
+	if err := Main([]string{"", "format", metaURL, "--bucket", bucket, "--max-snapshots", "3", testVolume}); err != nil {
+		t.Fatalf("format: %s", err)
+	}
+	// nor can a re-format set one
+	if err := Main([]string{"", "format", metaURL, "--max-snapshots", "-1", testVolume}); err == nil {
+		t.Fatalf("re-format with a negative --max-snapshots succeeded")
+	}
+	m := meta.NewClient(metaURL, nil)
+	format, err := m.Load(true)
+	if err != nil {
+		t.Fatalf("load format: %s", err)
+	}
+	if format.MaxSnapshots != 3 {
+		t.Fatalf("max snapshots %d, want 3", format.MaxSnapshots)
+	}
+}
