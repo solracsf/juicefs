@@ -4447,6 +4447,10 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	if set&SetAttrFlag != 0 {
+		// only CreateSnapshot freezes an inode
+		if attr.Flags&FlagSnapshot != 0 && cur.Flags&FlagSnapshot == 0 {
+			return nil, syscall.EPERM
+		}
 		dirtyAttr.Flags = attr.Flags
 		changed = true
 	}

@@ -4743,17 +4743,25 @@ func checkEntry(t *testing.T, m Meta, srcEntry, dstEntry *Entry, dstParentIno In
 // and the snapshot cannot be rewritten through it.
 func testSnapshotFlag(t *testing.T, m Meta) {
 	ctx := Background()
-	var inode Ino
+	var src, inode Ino
 	// Mknod persists the Flags left in the attr it is handed, so every call here
 	// gets a fresh one rather than reusing an attr a GetAttr has filled in
-	if st := m.Mknod(ctx, RootInode, "snapshotFlag", TypeFile, 0644, 022, 0, "", &inode, &Attr{}); st != 0 {
+	if st := m.Mknod(ctx, RootInode, "snapshotFlagSrc", TypeFile, 0644, 022, 0, "", &src, &Attr{}); st != 0 {
 		t.Fatalf("mknod: %s", st)
 	}
-	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlag", false) }()
+	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlagSrc", false) }()
 
+	// only the snapshot code path freezes an inode
 	frozen := uint8(FlagImmutable | FlagSnapshot)
-	if st := m.SetAttr(ctx, inode, SetAttrFlag, 0, &Attr{Flags: frozen}); st != 0 {
+	if st := m.SetAttr(ctx, src, SetAttrFlag, 0, &Attr{Flags: frozen}); st != syscall.EPERM {
+		t.Fatalf("freezing an inode by hand should be EPERM, got %s", st)
+	}
+	if st := m.getBase().cloneEntry(ctx, src, RootInode, "snapshotFlag", nil, CLONE_MODE_PRESERVE_ATTR|CLONE_MODE_SNAPSHOT, 022, new(uint64), true, make(chan struct{}, 1)); st != 0 {
 		t.Fatalf("freeze: %s", st)
+	}
+	defer func() { _ = m.Unlink(ctx, RootInode, "snapshotFlag", false) }()
+	if st := m.Lookup(ctx, RootInode, "snapshotFlag", &inode, &Attr{}, false); st != 0 {
+		t.Fatalf("lookup: %s", st)
 	}
 
 	// every direction is refused, including as root (Background() is uid 0)

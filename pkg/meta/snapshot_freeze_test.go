@@ -219,3 +219,25 @@ func TestSnapshotCloneMode(t *testing.T) {
 		}
 	}
 }
+
+// SetAttr cannot raise FlagSnapshot: only CreateSnapshot freezes an inode.
+func TestSnapshotFlagRaise(t *testing.T) {
+	for name, m := range snapshotFreezeMetas(t, nil, nil) {
+		ctx := Background()
+		var f Ino
+		if st := m.Create(ctx, RootInode, "f", 0644, 0, 0, &f, &Attr{}); st != 0 {
+			t.Fatalf("%s: create: %s", name, st)
+		}
+		for _, flags := range []uint8{FlagSnapshot, FlagSnapshot | FlagImmutable} {
+			if st := m.SetAttr(ctx, f, SetAttrFlag, 0, &Attr{Flags: flags}); st != syscall.EPERM {
+				t.Errorf("%s: setting flags %d on a live inode should be EPERM, got %v", name, flags, st)
+			}
+		}
+		if got := rawAttr(t, m, f).Flags; got != 0 {
+			t.Errorf("%s: flags of the live inode changed to %d", name, got)
+		}
+		if st := m.SetAttr(ctx, f, SetAttrFlag, 0, &Attr{Flags: FlagImmutable}); st != 0 {
+			t.Errorf("%s: chattr +i on a live inode: %v", name, st)
+		}
+	}
+}
