@@ -4771,7 +4771,9 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		srcNodeMap := make(map[Ino][]byte, len(srcInodes))
 		for i, ino := range srcInodes {
 			if srcVals[i] == nil {
-				return syscall.ENOENT
+				// deleted since it was listed; the rest of the batch is still copied
+				logger.Debugf("doBatchClone: source inode %d deleted, skipping", ino)
+				continue
 			}
 			srcNodeMap[ino] = srcVals[i]
 		}
@@ -4787,12 +4789,14 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 		fileClones := make([]fileCloneInfo, 0)
 		symlinkClones := make([]symlinkCloneInfo, 0)
+		cloned := make([]*cloneInfo, 0, len(cloneInfos))
 
 		for _, info := range cloneInfos {
 			sv, ok := srcNodeMap[info.srcIno]
 			if !ok {
-				return syscall.ENOENT
+				continue
 			}
+			cloned = append(cloned, info)
 			var attr Attr
 			m.parseAttr(sv, &attr)
 			if attr.Typ == TypeDirectory {
@@ -4898,10 +4902,10 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			tx.set(m.symKey(sc.dstIno), target)
 		}
-		if m.getFormat().ChangeLog {
-			args := make([]string, 0, 2*len(cloneInfos))
-			inodes := make([]string, 0, len(cloneInfos))
-			for _, info := range cloneInfos {
+		if m.getFormat().ChangeLog && len(cloned) > 0 {
+			args := make([]string, 0, 2*len(cloned))
+			inodes := make([]string, 0, len(cloned))
+			for _, info := range cloned {
 				args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(info.name))
 				inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
 			}

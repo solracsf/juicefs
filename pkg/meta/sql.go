@@ -5769,11 +5769,15 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		fileInodes := make([]Ino, 0)
 		symlinkInodes := make([]Ino, 0)
 		symlinkClones := make([]*cloneInfo, 0)
+		cloned := make([]*cloneInfo, 0, len(cloneInfos))
 		for _, info := range cloneInfos {
 			sn, ok := srcNodeMap[info.srcIno]
 			if !ok {
-				return syscall.ENOENT
+				// deleted since it was listed; the rest of the batch is still copied
+				logger.Debugf("doBatchClone: source inode %d deleted, skipping", info.srcIno)
+				continue
 			}
+			cloned = append(cloned, info)
 			if sn.Type == TypeDirectory {
 				return syscall.EINVAL
 			}
@@ -5852,10 +5856,10 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				chunksByInode[c.Inode] = append(chunksByInode[c.Inode], c)
 			}
 			chunksIns := make([]interface{}, 0, len(srcChunks))
-			for i := range cloneInfos {
-				for _, c := range chunksByInode[cloneInfos[i].srcIno] {
+			for _, info := range cloned {
+				for _, c := range chunksByInode[info.srcIno] {
 					chunksIns = append(chunksIns, &chunk{
-						Inode: cloneInfos[i].dstIno, Indx: c.Indx, Slices: c.Slices,
+						Inode: info.dstIno, Indx: c.Indx, Slices: c.Slices,
 					})
 					for _, sli := range readSliceBuf(c.Slices) {
 						if sli.id > 0 {
@@ -5901,9 +5905,9 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				xattrsByInode[x.Inode] = append(xattrsByInode[x.Inode], x)
 			}
 			xattrsIns := make([]interface{}, 0, len(srcXattrs))
-			for i := range cloneInfos {
-				for _, x := range xattrsByInode[cloneInfos[i].srcIno] {
-					xattrsIns = append(xattrsIns, &xattr{Inode: cloneInfos[i].dstIno, Name: x.Name, Value: x.Value})
+			for _, info := range cloned {
+				for _, x := range xattrsByInode[info.srcIno] {
+					xattrsIns = append(xattrsIns, &xattr{Inode: info.dstIno, Name: x.Name, Value: x.Value})
 				}
 			}
 			if err := mustInsert(s, xattrsIns...); err != nil {
@@ -5914,11 +5918,11 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		if err := m.batchUpdateChunkRefs(s, chunkRefCounts); err != nil {
 			return err
 		}
-		if m.getFormat().ChangeLog {
+		if m.getFormat().ChangeLog && len(cloned) > 0 {
 			// Keep encoded names and inode IDs within MySQL's 64 KiB TEXT limit.
 			const logBatchSize = 64
-			for start := 0; start < len(cloneInfos); start += logBatchSize {
-				batch := cloneInfos[start:min(start+logBatchSize, len(cloneInfos))]
+			for start := 0; start < len(cloned); start += logBatchSize {
+				batch := cloned[start:min(start+logBatchSize, len(cloned))]
 				args := make([]string, 0, 2*len(batch))
 				inodes := make([]string, 0, len(batch))
 				for _, info := range batch {

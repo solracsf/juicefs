@@ -21,6 +21,8 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -338,6 +340,97 @@ func TestCloneSpecialFiles(t *testing.T) {
 				} else if attr.Typ != s.typ || attr.Rdev != s.rdev {
 					t.Errorf("%s copied as type %d rdev %#x, want type %d rdev %#x", s.name, attr.Typ, attr.Rdev, s.typ, s.rdev)
 				}
+			}
+		})
+	}
+}
+
+// unlinkDuringBatch removes parent/name when the batch copy of parent starts,
+// as an application deleting a file while its directory is being copied.
+type unlinkDuringBatch struct {
+	engine
+	m      Meta
+	parent Ino
+	name   string
+	done   atomic.Bool
+}
+
+// arm sets the file to remove at the next batch copy of parent.
+func (e *unlinkDuringBatch) arm(parent Ino, name string) {
+	e.parent, e.name = parent, name
+	e.done.Store(false)
+}
+
+func (e *unlinkDuringBatch) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
+	if srcParent == e.parent && e.done.CompareAndSwap(false, true) {
+		if st := e.m.Unlink(Background(), e.parent, e.name); st != 0 {
+			panic(st)
+		}
+	}
+	return e.engine.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, result)
+}
+
+func makeTreeWithVictims(t *testing.T, m Meta, name string) (dir, sub Ino) {
+	t.Helper()
+	ctx := Background()
+	if st := m.Mkdir(ctx, RootInode, name, 0755, 022, 0, &dir, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Mkdir(ctx, dir, "sub", 0755, 022, 0, &sub, &Attr{}); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	var ino Ino
+	for _, n := range []string{"a", "b", "c", "victim"} {
+		for _, p := range []Ino{dir, sub} {
+			if st := m.Mknod(ctx, p, n, TypeFile, 0644, 022, 0, "", &ino, &Attr{}); st != 0 {
+				t.Fatalf("mknod: %s", st)
+			}
+		}
+	}
+	return dir, sub
+}
+
+// checkCopiedDir expects the copy of a directory made by makeTreeWithVictims
+// to hold a, b and c, and victim unless it was deleted during the copy.
+func checkCopiedDir(t *testing.T, m Meta, dir Ino, where string, victimDeleted bool) {
+	t.Helper()
+	var ino Ino
+	for _, n := range []string{"a", "b", "c"} {
+		if st := m.Lookup(Background(), dir, n, &ino, &Attr{}, false); st != 0 {
+			t.Errorf("the copy lost untouched %s/%s: %s", where, n, st)
+		}
+	}
+	st := m.Lookup(Background(), dir, "victim", &ino, &Attr{}, false)
+	if victimDeleted && st != syscall.ENOENT {
+		t.Errorf("the copy holds the deleted %s/victim: %s", where, st)
+	} else if !victimDeleted && st != 0 {
+		t.Errorf("the copy lost untouched %s/victim: %s", where, st)
+	}
+}
+
+// A file deleted while its directory is copied is left out of the copy; its
+// siblings, and the rest of the tree, are kept.
+func TestCloneDeleteDuringCopy(t *testing.T) {
+	for _, kind := range cloneTestEngines {
+		t.Run(kind, func(t *testing.T) {
+			w := &unlinkDuringBatch{}
+			m := newCloneTestMeta(t, kind, func(e engine) engine { w.engine = e; return w })
+			w.m = m
+			for _, tc := range []struct {
+				name  string
+				inSub bool
+			}{{"sub", true}, {"top", false}} {
+				dir, sub := makeTreeWithVictims(t, m, tc.name)
+				victimDir := dir
+				if tc.inSub {
+					victimDir = sub
+				}
+				w.arm(victimDir, "victim")
+				mustClone(t, m, RootInode, dir, RootInode, tc.name+"-copy")
+				copied, _ := mustLookup(t, m, RootInode, tc.name+"-copy")
+				copiedSub, _ := mustLookup(t, m, copied, "sub")
+				checkCopiedDir(t, m, copied, tc.name, !tc.inSub)
+				checkCopiedDir(t, m, copiedSub, tc.name+"/sub", tc.inSub)
 			}
 		})
 	}
