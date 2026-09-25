@@ -85,6 +85,10 @@ jobs:
           make juicefs.lite
           ./juicefs.lite version
 
+      - name: build nos3
+        timeout-minutes: 10
+        run: go build -tags nos3 -o /dev/null .
+
       - name: build windows
         timeout-minutes: 10
         run: make juicefs.exe

@@ -37,6 +37,8 @@ var logger = utils.GetLogger("juicefs")
 
 var UserAgent = "JuiceFS"
 
+const s3RequestIDKey = "X-Amz-Request-Id"
+
 type MtimeChanger interface {
 	Chtimes(path string, mtime time.Time) error
 }
@@ -336,6 +338,16 @@ func decodeKey(value string, typ *string) (string, error) {
 		return url.QueryUnescape(value)
 	}
 	return value, nil
+}
+
+func isExists(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "BucketAlreadyExists") || strings.Contains(msg, "BucketAlreadyOwnedByYou")
+}
+
+func defaultPathStyle() bool {
+	v := os.Getenv("JFS_S3_VHOST_STYLE")
+	return v == "" || v == "0" || v == "false"
 }
 
 func TmpFilePath(parent, name string) string {
