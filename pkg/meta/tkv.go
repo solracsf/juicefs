@@ -4047,6 +4047,9 @@ func (m *kvMeta) dumpDirFast(inode Ino, tree *DumpedEntry, bw *bufio.Writer, dep
 }
 
 func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) (err error) {
+	if err = m.checkDumpRoot(); err != nil {
+		return err
+	}
 	setting, err := m.dumpedFormat()
 	if err != nil {
 		return err

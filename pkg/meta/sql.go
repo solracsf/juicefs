@@ -5098,6 +5098,9 @@ func (m *dbMeta) makeSnap(ses *xorm.Session, bar *utils.Bar) error {
 }
 
 func (m *dbMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) (err error) {
+	if err = m.checkDumpRoot(); err != nil {
+		return err
+	}
 	setting, err := m.dumpedFormat()
 	if err != nil {
 		return err

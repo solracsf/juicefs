@@ -3337,6 +3337,26 @@ func (m *baseMeta) raiseMetaVersion() error {
 	return nil
 }
 
+// checkDumpRoot refuses to dump a snapshot, or the hidden root that holds them,
+// as a volume: a load fixes the root of a dump at the root inode but keeps the
+// entries as they are, and those of a snapshot are frozen, so the volume loaded
+// from such a dump could never be changed or emptied. Clone the snapshot into a
+// live directory and dump that instead.
+func (m *baseMeta) checkDumpRoot() error {
+	root := m.root
+	if root == RootInode {
+		return nil
+	}
+	var attr Attr
+	if st := m.en.doGetAttr(Background(), root, &attr); st != 0 && st != syscall.ENOENT {
+		return st
+	}
+	if root.IsSnapshot() || attr.Flags&FlagSnapshot != 0 {
+		return fmt.Errorf("cannot dump a snapshot (inode %d) as a volume: its entries are frozen; clone it into a live directory and dump that", root)
+	}
+	return nil
+}
+
 // dumpedFormat is the format a dump records: the loaded one, with the stored
 // metadata version when a snapshot has raised it since the load.
 func (m *baseMeta) dumpedFormat() (Format, error) {

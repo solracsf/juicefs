@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"path"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -424,6 +425,58 @@ func TestSnapshotSkipsTakenInodes(t *testing.T) {
 			}
 			if snaps, st := m.ListSnapshots(ctx); st != 0 || len(snaps) != 2 {
 				t.Fatalf("snapshots: %v, %d, want 2", st, len(snaps))
+			}
+		})
+	}
+}
+
+// A dump of a snapshot, or of the hidden root that holds them, is refused: the
+// volume loaded from it would keep the frozen entries, and so could never be
+// changed or emptied. A dump of a live directory is unaffected.
+func TestDumpRefusesSnapshotSubdir(t *testing.T) {
+	for _, e := range compatEngines() {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := Background()
+			m := newCompatMeta(t, e.uri(t))
+			var dir, file Ino
+			if st := m.Mkdir(ctx, RootInode, "d", 0755, 0, 0, &dir, nil); st != 0 {
+				t.Fatalf("mkdir: %s", st)
+			}
+			if st := m.Create(ctx, dir, "f", 0644, 0, 0, &file, nil); st != 0 {
+				t.Fatalf("create: %s", st)
+			}
+			if _, st := m.CreateSnapshot(ctx, dir, "s1", false, nil, nil); st != 0 {
+				t.Fatalf("create snapshot: %s", st)
+			}
+			b := m.getBase()
+			for _, subdir := range []string{SnapshotName, SnapshotName + "/s1"} {
+				b.chroot(RootInode)
+				if st := m.Chroot(ctx, subdir); st != 0 {
+					t.Fatalf("chroot %s: %s", subdir, st)
+				}
+				var buf bytes.Buffer
+				err := m.DumpMeta(&buf, RootInode, 1, true, false, false)
+				if err == nil || !strings.Contains(err.Error(), "cannot dump a snapshot") {
+					t.Fatalf("dump of %s: %v, want a refusal", subdir, err)
+				}
+				if buf.Len() != 0 {
+					t.Fatalf("dump of %s wrote %d bytes before refusing", subdir, buf.Len())
+				}
+			}
+			b.chroot(RootInode)
+			if st := m.Chroot(ctx, "d"); st != 0 {
+				t.Fatalf("chroot d: %s", st)
+			}
+			var buf bytes.Buffer
+			if err := m.DumpMeta(&buf, RootInode, 1, true, false, false); err != nil {
+				t.Fatalf("dump of a live directory: %s", err)
+			}
+			var dm DumpedMeta
+			if err := json.Unmarshal(buf.Bytes(), &dm); err != nil {
+				t.Fatalf("parse the dump: %s", err)
+			}
+			if dm.FSTree == nil || dm.FSTree.Entries["f"] == nil || dm.FSTree.Entries["f"].Attr.Flags&FlagSnapshot != 0 {
+				t.Fatalf("dump of a live directory: %+v", dm.FSTree)
 			}
 		})
 	}
