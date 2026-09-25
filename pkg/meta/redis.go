@@ -5433,138 +5433,173 @@ func (m *redisMeta) loadQuotasForDump(ctx Context, quotaKey string) map[uint64]*
 	return quotas
 }
 
-func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
-	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
-		if err != nil {
-			return err
-		}
-		m.parseAttr(a, originAttr)
-		attr := *originAttr
-		if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
-			return eno
-		}
-		attr.Parent = parent
-		attr.Flags = cloneFlags(attr.Flags, cmode)
-		now := time.Now()
-		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
-			attr.Uid = ctx.Uid()
-			attr.Gid = ctx.Gid()
-			attr.Mode &= ^cumask
-			attr.Atime = now.Unix()
-			attr.Mtime = now.Unix()
-			attr.Ctime = now.Unix()
-			attr.Atimensec = uint32(now.Nanosecond())
-			attr.Mtimensec = uint32(now.Nanosecond())
-			attr.Ctimensec = uint32(now.Nanosecond())
-		}
-		// TODO: preserve hardlink
-		if attr.Typ == TypeFile && attr.Nlink > 1 {
-			attr.Nlink = 1
-		}
-		srcXattr, err := tx.HGetAll(ctx, m.xattrKey(srcIno)).Result()
-		if err != nil {
-			return err
-		}
+// errWatchChunks restarts a clone transaction that found more chunks on a
+// source file than it watches.
+var errWatchChunks = errors.New("more chunks to watch")
 
-		var pattr Attr
-		if top {
-			if a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes(); err != nil {
+// fileChunks returns the number of chunks a file of this length holds.
+func fileChunks(attr *Attr) int {
+	if attr.Typ != TypeFile || attr.Length == 0 {
+		return 0
+	}
+	return int(attr.Length/ChunkSize) + 1
+}
+
+// cloneWatchKeys lists the keys a clone of inode watches: its attributes and
+// extended attributes, and its first chunks chunks. Compaction rewrites a chunk
+// under a watch on that key alone, so a copy that did not watch it could keep
+// slices compaction has just released.
+func (m *redisMeta) cloneWatchKeys(inode Ino, chunks int) []string {
+	keys := make([]string, 0, chunks+2)
+	keys = append(keys, m.inodeKey(inode), m.xattrKey(inode))
+	for i := 0; i < chunks; i++ {
+		keys = append(keys, m.chunkKey(inode, uint32(i)))
+	}
+	return keys
+}
+
+func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
+	var chunks int
+	for {
+		err := m.txn(ctx, func(tx *redis.Tx) error {
+			a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
+			if err != nil {
 				return err
-			} else {
-				m.parseAttr(a, &pattr)
 			}
-			if pattr.Typ != TypeDirectory {
-				return syscall.ENOTDIR
+			m.parseAttr(a, originAttr)
+			attr := *originAttr
+			if n := fileChunks(&attr); n > chunks {
+				chunks = n
+				return errWatchChunks
 			}
-			if (pattr.Flags & FlagImmutable) != 0 {
-				return syscall.EPERM
-			}
-			if exist, err := tx.HExists(ctx, m.entryKey(parent), name).Result(); err != nil {
-				return err
-			} else if exist {
-				return syscall.EEXIST
-			}
-			if eno := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
+			if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
 				return eno
 			}
-		}
+			attr.Parent = parent
+			attr.Flags = cloneFlags(attr.Flags, cmode)
+			now := time.Now()
+			if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
+				attr.Uid = ctx.Uid()
+				attr.Gid = ctx.Gid()
+				attr.Mode &= ^cumask
+				attr.Atime = now.Unix()
+				attr.Mtime = now.Unix()
+				attr.Ctime = now.Unix()
+				attr.Atimensec = uint32(now.Nanosecond())
+				attr.Mtimensec = uint32(now.Nanosecond())
+				attr.Ctimensec = uint32(now.Nanosecond())
+			}
+			// TODO: preserve hardlink
+			if attr.Typ == TypeFile && attr.Nlink > 1 {
+				attr.Nlink = 1
+			}
+			srcXattr, err := tx.HGetAll(ctx, m.xattrKey(srcIno)).Result()
+			if err != nil {
+				return err
+			}
 
-		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
-			p.Set(ctx, m.inodeKey(ino), m.marshal(&attr), 0)
-			if cmode&CLONE_MODE_SNAPSHOT == 0 {
-				p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
-				p.Incr(ctx, m.totalInodesKey())
-			}
-			if len(srcXattr) > 0 {
-				p.HMSet(ctx, m.xattrKey(ino), srcXattr)
-			}
-			if top && attr.Typ == TypeDirectory {
-				p.ZAdd(ctx, m.detachedNodes(), redis.Z{Member: ino.String(), Score: float64(time.Now().Unix())})
-			} else {
-				p.HSet(ctx, m.entryKey(parent), name, m.packEntry(attr.Typ, ino))
-				if top {
-					pattr.Mtime = now.Unix()
-					pattr.Mtimensec = uint32(now.Nanosecond())
-					pattr.Ctime = now.Unix()
-					pattr.Ctimensec = uint32(now.Nanosecond())
-					p.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+			var pattr Attr
+			if top {
+				if a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes(); err != nil {
+					return err
+				} else {
+					m.parseAttr(a, &pattr)
+				}
+				if pattr.Typ != TypeDirectory {
+					return syscall.ENOTDIR
+				}
+				if (pattr.Flags & FlagImmutable) != 0 {
+					return syscall.EPERM
+				}
+				if exist, err := tx.HExists(ctx, m.entryKey(parent), name).Result(); err != nil {
+					return err
+				} else if exist {
+					return syscall.EEXIST
+				}
+				if eno := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
+					return eno
 				}
 			}
 
-			switch attr.Typ {
-			case TypeDirectory:
-				sfield := srcIno.String()
-				field := ino.String()
-				if v, err := tx.HGet(ctx, m.dirUsedInodesKey(), sfield).Result(); err == nil {
-					p.HSet(ctx, m.dirUsedInodesKey(), field, v)
-					p.HSet(ctx, m.dirDataLengthKey(), field, tx.HGet(ctx, m.dirDataLengthKey(), sfield).Val())
-					p.HSet(ctx, m.dirUsedSpaceKey(), field, tx.HGet(ctx, m.dirUsedSpaceKey(), sfield).Val())
+			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				p.Set(ctx, m.inodeKey(ino), m.marshal(&attr), 0)
+				if cmode&CLONE_MODE_SNAPSHOT == 0 {
+					p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
+					p.Incr(ctx, m.totalInodesKey())
 				}
-			case TypeFile:
-				// copy chunks
-				if attr.Length != 0 {
-					var vals [][]string
-					for i := 0; i <= int(attr.Length/ChunkSize); i++ {
-						val, err := tx.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1).Result()
-						if err != nil {
-							return err
-						}
-						vals = append(vals, val)
+				if len(srcXattr) > 0 {
+					p.HMSet(ctx, m.xattrKey(ino), srcXattr)
+				}
+				if top && attr.Typ == TypeDirectory {
+					p.ZAdd(ctx, m.detachedNodes(), redis.Z{Member: ino.String(), Score: float64(time.Now().Unix())})
+				} else {
+					p.HSet(ctx, m.entryKey(parent), name, m.packEntry(attr.Typ, ino))
+					if top {
+						pattr.Mtime = now.Unix()
+						pattr.Mtimensec = uint32(now.Nanosecond())
+						pattr.Ctime = now.Unix()
+						pattr.Ctimensec = uint32(now.Nanosecond())
+						p.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
 					}
+				}
 
-					for i, sv := range vals {
-						if len(sv) == 0 {
-							continue
+				switch attr.Typ {
+				case TypeDirectory:
+					sfield := srcIno.String()
+					field := ino.String()
+					if v, err := tx.HGet(ctx, m.dirUsedInodesKey(), sfield).Result(); err == nil {
+						p.HSet(ctx, m.dirUsedInodesKey(), field, v)
+						p.HSet(ctx, m.dirDataLengthKey(), field, tx.HGet(ctx, m.dirDataLengthKey(), sfield).Val())
+						p.HSet(ctx, m.dirUsedSpaceKey(), field, tx.HGet(ctx, m.dirUsedSpaceKey(), sfield).Val())
+					}
+				case TypeFile:
+					// copy chunks
+					if attr.Length != 0 {
+						var vals [][]string
+						for i := 0; i <= int(attr.Length/ChunkSize); i++ {
+							val, err := tx.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1).Result()
+							if err != nil {
+								return err
+							}
+							vals = append(vals, val)
 						}
-						ss := readSlices(sv)
-						if ss == nil {
-							return syscall.EIO
-						}
-						p.RPush(ctx, m.chunkKey(ino, uint32(i)), sv)
-						for _, s := range ss {
-							if s.id > 0 {
-								p.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), 1)
+
+						for i, sv := range vals {
+							if len(sv) == 0 {
+								continue
+							}
+							ss := readSlices(sv)
+							if ss == nil {
+								return syscall.EIO
+							}
+							p.RPush(ctx, m.chunkKey(ino, uint32(i)), sv)
+							for _, s := range ss {
+								if s.id > 0 {
+									p.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), 1)
+								}
 							}
 						}
 					}
+				case TypeSymlink:
+					path, err := tx.Get(ctx, m.symKey(srcIno)).Result()
+					if err != nil {
+						return err
+					}
+					p.Set(ctx, m.symKey(ino), path, 0)
 				}
-			case TypeSymlink:
-				path, err := tx.Get(ctx, m.symKey(srcIno)).Result()
-				if err != nil {
-					return err
-				}
-				p.Set(ctx, m.symKey(ino), path, 0)
+				m.genLog(ctx, p, now, "CLONE(%d,%d,%s,%d,%d,%d,%t,%d,%s):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ctx.Uid(), logGids(ctx), ino)
+				return nil
+			})
+			if err != nil {
+				return err
 			}
-			m.genLog(ctx, p, now, "CLONE(%d,%d,%s,%d,%d,%d,%t,%d,%s):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ctx.Uid(), logGids(ctx), ino)
+			*originAttr = attr
 			return nil
-		})
-		if err != nil {
-			return err
+		}, m.cloneWatchKeys(srcIno, chunks)...)
+		if err != errWatchChunks {
+			return errno(err)
 		}
-		*originAttr = attr
-		return nil
-	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
+	}
 }
 
 func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
@@ -5605,6 +5640,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 		nameSet := make(map[string]struct{}, len(batch))
 		srcSet := make(map[Ino]struct{}, len(batch))
 		srcList := make([]Ino, 0, len(batch))
+		chunks := make(map[Ino]int, len(batch)) // chunks watched per source, as listed
 		for _, e := range batch {
 			name := string(e.Name)
 			if _, ok := nameSet[name]; ok {
@@ -5625,260 +5661,276 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 			if _, ok := srcSet[e.Inode]; !ok {
 				srcSet[e.Inode] = struct{}{}
 				srcList = append(srcList, e.Inode)
+				if e.Attr != nil {
+					chunks[e.Inode] = fileChunks(e.Attr)
+				}
 			}
-		}
-
-		watchKeys := make([]string, 0, len(srcList)*2+1)
-		watchKeys = append(watchKeys, m.inodeKey(dstParent))
-		for _, ino := range srcList {
-			watchKeys = append(watchKeys, m.inodeKey(ino), m.xattrKey(ino))
 		}
 
 		var batchResult batchCloneResult
-		err := m.txn(ctx, func(tx *redis.Tx) error {
-			now := time.Now()
-			var pattr Attr
-			pval, err := tx.Get(ctx, m.inodeKey(dstParent)).Bytes()
-			if err == redis.Nil {
-				return syscall.ENOENT
+		var err error
+		for {
+			watchKeys := make([]string, 0, len(srcList)*2+1)
+			watchKeys = append(watchKeys, m.inodeKey(dstParent))
+			for _, ino := range srcList {
+				watchKeys = append(watchKeys, m.cloneWatchKeys(ino, chunks[ino])...)
 			}
-			if err != nil {
-				return err
-			}
-			m.parseAttr(pval, &pattr)
-			if pattr.Typ != TypeDirectory {
-				return syscall.ENOTDIR
-			}
-			if (pattr.Flags&FlagImmutable) != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
-				return syscall.EPERM
-			}
-			if st := m.Access(ctx, dstParent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
-				return st
-			}
-
-			existsPipe := tx.Pipeline()
-			existsCmds := make([]*redis.BoolCmd, 0, len(infos))
-			for _, info := range infos {
-				existsCmds = append(existsCmds, existsPipe.HExists(ctx, m.entryKey(dstParent), string(info.entry.Name)))
-			}
-			if _, err := existsPipe.Exec(ctx); err != nil {
-				return err
-			}
-			for _, cmd := range existsCmds {
-				exist, err := cmd.Result()
+			err = m.txn(ctx, func(tx *redis.Tx) error {
+				now := time.Now()
+				var pattr Attr
+				pval, err := tx.Get(ctx, m.inodeKey(dstParent)).Bytes()
+				if err == redis.Nil {
+					return syscall.ENOENT
+				}
 				if err != nil {
 					return err
 				}
-				if exist {
-					return syscall.EEXIST
+				m.parseAttr(pval, &pattr)
+				if pattr.Typ != TypeDirectory {
+					return syscall.ENOTDIR
 				}
-			}
-
-			srcKeys := make([]string, 0, len(srcList))
-			for _, ino := range srcList {
-				srcKeys = append(srcKeys, m.inodeKey(ino))
-			}
-			srcVals, err := tx.MGet(ctx, srcKeys...).Result()
-			if err != nil {
-				return err
-			}
-			srcData := make(map[Ino]*sourceData, len(srcList))
-			for i, v := range srcVals {
-				if v == nil {
-					logger.Debugf("doBatchClone: source inode %d deleted, skipping", srcList[i])
-					continue
+				if (pattr.Flags&FlagImmutable) != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
+					return syscall.EPERM
 				}
-				var a Attr
-				m.parseAttr([]byte(v.(string)), &a)
-				if a.Typ == TypeDirectory {
-					logger.Warnf("doBatchClone: source inode %d is a directory, skipping", srcList[i])
-					continue
-				}
-				if st := m.Access(ctx, srcList[i], MODE_MASK_R, &a); st != 0 {
+				if st := m.Access(ctx, dstParent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
 					return st
 				}
-				srcData[srcList[i]] = &sourceData{attr: a}
-			}
 
-			readPipe := tx.Pipeline()
-			xcmds := make(map[Ino]*redis.MapStringStringCmd, len(srcList))
-			scmds := make(map[Ino]*redis.StringCmd)
-			type chunkCmd struct {
-				srcIno Ino
-				indx   uint32
-				cmd    *redis.StringSliceCmd
-			}
-			var ccmds []chunkCmd
-			for _, ino := range srcList {
-				sd, ok := srcData[ino]
-				if !ok {
-					continue
+				existsPipe := tx.Pipeline()
+				existsCmds := make([]*redis.BoolCmd, 0, len(infos))
+				for _, info := range infos {
+					existsCmds = append(existsCmds, existsPipe.HExists(ctx, m.entryKey(dstParent), string(info.entry.Name)))
 				}
-				xcmds[ino] = readPipe.HGetAll(ctx, m.xattrKey(ino))
-				a := sd.attr
-				switch a.Typ {
-				case TypeFile:
-					if a.Length != 0 {
-						chunkNum := int(a.Length/ChunkSize) + 1
-						sd.chunks = make([]chunkData, chunkNum)
-						for i := 0; i < chunkNum; i++ {
-							cmd := readPipe.LRange(ctx, m.chunkKey(ino, uint32(i)), 0, -1)
-							ccmds = append(ccmds, chunkCmd{srcIno: ino, indx: uint32(i), cmd: cmd})
-						}
+				if _, err := existsPipe.Exec(ctx); err != nil {
+					return err
+				}
+				for _, cmd := range existsCmds {
+					exist, err := cmd.Result()
+					if err != nil {
+						return err
 					}
-				case TypeSymlink:
-					scmds[ino] = readPipe.Get(ctx, m.symKey(ino))
-				default:
-					logger.Warnf("doBatchClone: unsupported type %d for inode %d, skipping", a.Typ, ino)
-					delete(srcData, ino)
+					if exist {
+						return syscall.EEXIST
+					}
 				}
-			}
-			if _, err := readPipe.Exec(ctx); err != nil && err != redis.Nil {
-				return err
-			}
 
-			for ino, cmd := range xcmds {
-				val, err := cmd.Result()
-				if err != nil {
-					logger.Warnf("doBatchClone: HGetAll xattr for inode %d: %v (should not happen)", ino, err)
-					continue
+				srcKeys := make([]string, 0, len(srcList))
+				for _, ino := range srcList {
+					srcKeys = append(srcKeys, m.inodeKey(ino))
 				}
-				if sd, ok := srcData[ino]; ok {
-					sd.xattr = val
-				}
-			}
-			for _, c := range ccmds {
-				sd, ok := srcData[c.srcIno]
-				if !ok {
-					continue
-				}
-				val, err := c.cmd.Result()
+				srcVals, err := tx.MGet(ctx, srcKeys...).Result()
 				if err != nil {
 					return err
 				}
-				if len(val) == 0 {
-					continue
-				}
-				ss := readSlices(val)
-				if ss == nil {
-					return syscall.EIO
-				}
-				sd.chunks[c.indx] = chunkData{vals: val, slices: ss}
-			}
-			for ino, cmd := range scmds {
-				sym, err := cmd.Result()
-				if err == redis.Nil {
-					logger.Debugf("doBatchClone: symlink target for inode %d disappeared, skipping", ino)
-					delete(srcData, ino)
-					continue
-				}
-				if err != nil {
-					return err
-				}
-				if sd, ok := srcData[ino]; ok {
-					sd.sym = sym
-				}
-			}
-
-			batchResult = batchCloneResult{deltas: make(ugQuotaDeltas)}
-			refDelta := make(map[string]int64)
-			validInfos := make([]*cloneInfo, 0, len(infos))
-			for _, info := range infos {
-				sd, ok := srcData[info.srcIno]
-				if !ok {
-					logger.Debugf("doBatchClone: source inode %d no longer available, skipping", info.srcIno)
-					continue
-				}
-				info.dstAttr = sd.attr
-				info.dstAttr.Parent = dstParent
-				if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
-					info.dstAttr.Uid = ctx.Uid()
-					info.dstAttr.Gid = ctx.Gid()
-					info.dstAttr.Mode &= ^cumask
-					info.dstAttr.Atime = now.Unix()
-					info.dstAttr.Mtime = now.Unix()
-					info.dstAttr.Ctime = now.Unix()
-					info.dstAttr.Atimensec = uint32(now.Nanosecond())
-					info.dstAttr.Mtimensec = uint32(now.Nanosecond())
-					info.dstAttr.Ctimensec = uint32(now.Nanosecond())
-				}
-				if info.dstAttr.Typ == TypeFile && info.dstAttr.Nlink > 1 {
-					info.dstAttr.Nlink = 1
-				}
-				info.dstAttr.Flags = cloneFlags(info.dstAttr.Flags, cmode)
-				info.xattr = sd.xattr
-				if info.dstAttr.Typ == TypeFile {
-					batchResult.length += int64(sd.attr.Length)
-				}
-				entrySpace := align4K(sd.attr.Length)
-				batchResult.space += entrySpace
-				batchResult.inodes++
-				batchResult.deltas.add(&ugQuotaDelta{
-					Uid:    info.dstAttr.Uid,
-					Gid:    info.dstAttr.Gid,
-					Space:  entrySpace,
-					Inodes: 1,
-				})
-
-				if info.dstAttr.Typ == TypeFile {
-					for _, chunk := range sd.chunks {
-						if len(chunk.slices) == 0 {
-							continue
-						}
-						for _, s := range chunk.slices {
-							if s.id > 0 {
-								refDelta[m.sliceKey(s.id, s.size)]++
-							}
-						}
+				srcData := make(map[Ino]*sourceData, len(srcList))
+				var grown bool
+				for i, v := range srcVals {
+					if v == nil {
+						logger.Debugf("doBatchClone: source inode %d deleted, skipping", srcList[i])
+						continue
 					}
-				}
-				validInfos = append(validInfos, info)
-			}
-
-			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
-				for _, info := range validInfos {
-					sd := srcData[info.srcIno]
-					p.Set(ctx, m.inodeKey(info.dstIno), m.marshal(&info.dstAttr), 0)
-					p.HSet(ctx, m.entryKey(dstParent), string(info.entry.Name), m.packEntry(info.dstAttr.Typ, info.dstIno))
-					if len(info.xattr) > 0 {
-						p.HMSet(ctx, m.xattrKey(info.dstIno), info.xattr)
+					var a Attr
+					m.parseAttr([]byte(v.(string)), &a)
+					if a.Typ == TypeDirectory {
+						logger.Warnf("doBatchClone: source inode %d is a directory, skipping", srcList[i])
+						continue
 					}
-					switch info.dstAttr.Typ {
+					if n := fileChunks(&a); n > chunks[srcList[i]] {
+						chunks[srcList[i]] = n
+						grown = true
+					}
+					if st := m.Access(ctx, srcList[i], MODE_MASK_R, &a); st != 0 {
+						return st
+					}
+					srcData[srcList[i]] = &sourceData{attr: a}
+				}
+				if grown {
+					return errWatchChunks
+				}
+
+				readPipe := tx.Pipeline()
+				xcmds := make(map[Ino]*redis.MapStringStringCmd, len(srcList))
+				scmds := make(map[Ino]*redis.StringCmd)
+				type chunkCmd struct {
+					srcIno Ino
+					indx   uint32
+					cmd    *redis.StringSliceCmd
+				}
+				var ccmds []chunkCmd
+				for _, ino := range srcList {
+					sd, ok := srcData[ino]
+					if !ok {
+						continue
+					}
+					xcmds[ino] = readPipe.HGetAll(ctx, m.xattrKey(ino))
+					a := sd.attr
+					switch a.Typ {
 					case TypeFile:
-						for i, chunk := range sd.chunks {
-							if len(chunk.vals) == 0 {
-								continue
+						if a.Length != 0 {
+							chunkNum := int(a.Length/ChunkSize) + 1
+							sd.chunks = make([]chunkData, chunkNum)
+							for i := 0; i < chunkNum; i++ {
+								cmd := readPipe.LRange(ctx, m.chunkKey(ino, uint32(i)), 0, -1)
+								ccmds = append(ccmds, chunkCmd{srcIno: ino, indx: uint32(i), cmd: cmd})
 							}
-							p.RPush(ctx, m.chunkKey(info.dstIno, uint32(i)), chunk.vals)
 						}
 					case TypeSymlink:
-						p.Set(ctx, m.symKey(info.dstIno), sd.sym, 0)
+						scmds[ino] = readPipe.Get(ctx, m.symKey(ino))
+					default:
+						logger.Warnf("doBatchClone: unsupported type %d for inode %d, skipping", a.Typ, ino)
+						delete(srcData, ino)
 					}
 				}
-				if batchResult.space != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
-					p.IncrBy(ctx, m.usedSpaceKey(), batchResult.space)
+				if _, err := readPipe.Exec(ctx); err != nil && err != redis.Nil {
+					return err
 				}
-				if batchResult.inodes != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
-					p.IncrBy(ctx, m.totalInodesKey(), batchResult.inodes)
-				}
-				for field, delta := range refDelta {
-					if delta != 0 {
-						p.HIncrBy(ctx, m.sliceRefs(), field, delta)
+
+				for ino, cmd := range xcmds {
+					val, err := cmd.Result()
+					if err != nil {
+						logger.Warnf("doBatchClone: HGetAll xattr for inode %d: %v (should not happen)", ino, err)
+						continue
+					}
+					if sd, ok := srcData[ino]; ok {
+						sd.xattr = val
 					}
 				}
-				if m.getFormat().ChangeLog && len(validInfos) > 0 {
-					args := make([]string, 0, 2*len(validInfos))
-					inodes := make([]string, 0, len(validInfos))
+				for _, c := range ccmds {
+					sd, ok := srcData[c.srcIno]
+					if !ok {
+						continue
+					}
+					val, err := c.cmd.Result()
+					if err != nil {
+						return err
+					}
+					if len(val) == 0 {
+						continue
+					}
+					ss := readSlices(val)
+					if ss == nil {
+						return syscall.EIO
+					}
+					sd.chunks[c.indx] = chunkData{vals: val, slices: ss}
+				}
+				for ino, cmd := range scmds {
+					sym, err := cmd.Result()
+					if err == redis.Nil {
+						logger.Debugf("doBatchClone: symlink target for inode %d disappeared, skipping", ino)
+						delete(srcData, ino)
+						continue
+					}
+					if err != nil {
+						return err
+					}
+					if sd, ok := srcData[ino]; ok {
+						sd.sym = sym
+					}
+				}
+
+				batchResult = batchCloneResult{deltas: make(ugQuotaDeltas)}
+				refDelta := make(map[string]int64)
+				validInfos := make([]*cloneInfo, 0, len(infos))
+				for _, info := range infos {
+					sd, ok := srcData[info.srcIno]
+					if !ok {
+						logger.Debugf("doBatchClone: source inode %d no longer available, skipping", info.srcIno)
+						continue
+					}
+					info.dstAttr = sd.attr
+					info.dstAttr.Parent = dstParent
+					if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
+						info.dstAttr.Uid = ctx.Uid()
+						info.dstAttr.Gid = ctx.Gid()
+						info.dstAttr.Mode &= ^cumask
+						info.dstAttr.Atime = now.Unix()
+						info.dstAttr.Mtime = now.Unix()
+						info.dstAttr.Ctime = now.Unix()
+						info.dstAttr.Atimensec = uint32(now.Nanosecond())
+						info.dstAttr.Mtimensec = uint32(now.Nanosecond())
+						info.dstAttr.Ctimensec = uint32(now.Nanosecond())
+					}
+					if info.dstAttr.Typ == TypeFile && info.dstAttr.Nlink > 1 {
+						info.dstAttr.Nlink = 1
+					}
+					info.dstAttr.Flags = cloneFlags(info.dstAttr.Flags, cmode)
+					info.xattr = sd.xattr
+					if info.dstAttr.Typ == TypeFile {
+						batchResult.length += int64(sd.attr.Length)
+					}
+					entrySpace := align4K(sd.attr.Length)
+					batchResult.space += entrySpace
+					batchResult.inodes++
+					batchResult.deltas.add(&ugQuotaDelta{
+						Uid:    info.dstAttr.Uid,
+						Gid:    info.dstAttr.Gid,
+						Space:  entrySpace,
+						Inodes: 1,
+					})
+
+					if info.dstAttr.Typ == TypeFile {
+						for _, chunk := range sd.chunks {
+							if len(chunk.slices) == 0 {
+								continue
+							}
+							for _, s := range chunk.slices {
+								if s.id > 0 {
+									refDelta[m.sliceKey(s.id, s.size)]++
+								}
+							}
+						}
+					}
+					validInfos = append(validInfos, info)
+				}
+
+				_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 					for _, info := range validInfos {
-						args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(string(info.entry.Name)))
-						inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+						sd := srcData[info.srcIno]
+						p.Set(ctx, m.inodeKey(info.dstIno), m.marshal(&info.dstAttr), 0)
+						p.HSet(ctx, m.entryKey(dstParent), string(info.entry.Name), m.packEntry(info.dstAttr.Typ, info.dstIno))
+						if len(info.xattr) > 0 {
+							p.HMSet(ctx, m.xattrKey(info.dstIno), info.xattr)
+						}
+						switch info.dstAttr.Typ {
+						case TypeFile:
+							for i, chunk := range sd.chunks {
+								if len(chunk.vals) == 0 {
+									continue
+								}
+								p.RPush(ctx, m.chunkKey(info.dstIno, uint32(i)), chunk.vals)
+							}
+						case TypeSymlink:
+							p.Set(ctx, m.symKey(info.dstIno), sd.sym, 0)
+						}
 					}
-					m.genLog(ctx, p, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
-				}
-				return nil
-			})
-			return err
-		}, watchKeys...)
+					if batchResult.space != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
+						p.IncrBy(ctx, m.usedSpaceKey(), batchResult.space)
+					}
+					if batchResult.inodes != 0 && cmode&CLONE_MODE_SNAPSHOT == 0 {
+						p.IncrBy(ctx, m.totalInodesKey(), batchResult.inodes)
+					}
+					for field, delta := range refDelta {
+						if delta != 0 {
+							p.HIncrBy(ctx, m.sliceRefs(), field, delta)
+						}
+					}
+					if m.getFormat().ChangeLog && len(validInfos) > 0 {
+						args := make([]string, 0, 2*len(validInfos))
+						inodes := make([]string, 0, len(validInfos))
+						for _, info := range validInfos {
+							args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(string(info.entry.Name)))
+							inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+						}
+						m.genLog(ctx, p, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
+					}
+					return nil
+				})
+				return err
+			}, watchKeys...)
+			if err != errWatchChunks {
+				break
+			}
+		}
 		if err != nil {
 			return errno(err)
 		}
