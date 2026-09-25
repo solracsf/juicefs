@@ -129,7 +129,7 @@ func (f *Format) update(old *Format, force bool) error {
 			args = []interface{}{"shards", old.Shards, f.Shards}
 		case f.HashPrefix != old.HashPrefix:
 			args = []interface{}{"hash prefix", old.HashPrefix, f.HashPrefix}
-		case f.MetaVersion != old.MetaVersion:
+		case f.MetaVersion < old.MetaVersion:
 			args = []interface{}{"meta version", old.MetaVersion, f.MetaVersion}
 		}
 		if args == nil {
@@ -145,6 +145,27 @@ func (f *Format) update(old *Format, force bool) error {
 		} else {
 			return fmt.Errorf("cannot update volume %s from %v to %v", args...)
 		}
+	}
+	return nil
+}
+
+// keepVersions raises the metadata and minimum client versions of f to the ones
+// the stored format holds. A format is rewritten from a copy read earlier, by
+// config or format, so a raise made in between, by the first snapshot or by
+// another config, must not be lost: it is applied in the write itself.
+func (f *Format) keepVersions(stored []byte) error {
+	if len(stored) == 0 {
+		return nil
+	}
+	var old Format
+	if err := json.Unmarshal(stored, &old); err != nil {
+		return fmt.Errorf("existing format is broken: %s", err)
+	}
+	f.MetaVersion = max(f.MetaVersion, old.MetaVersion)
+	if below, err := belowVersion(f.MinClientVersion, old.MinClientVersion); err != nil {
+		return err
+	} else if below {
+		f.MinClientVersion = old.MinClientVersion
 	}
 	return nil
 }

@@ -559,12 +559,6 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(format, "", "")
-	if err != nil {
-		return fmt.Errorf("json: %s", err)
-	}
-
-	m.setFormat(format)
 	ts := time.Now().Unix()
 	attr := &Attr{
 		Typ:    TypeDirectory,
@@ -575,7 +569,15 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 		Length: 4 << 10,
 		Parent: RootInode,
 	}
-	return m.txn(Background(), func(tx *kvTxn) error {
+	err = m.txn(Background(), func(tx *kvTxn) error {
+		// the versions are kept against the stored format in the same transaction
+		if err := format.keepVersions(tx.get(m.fmtKey("setting"))); err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(format, "", "")
+		if err != nil {
+			return fmt.Errorf("json: %s", err)
+		}
 		if format.TrashDays > 0 {
 			buf := tx.get(m.inodeKey(TrashInode))
 			if buf == nil {
@@ -592,6 +594,11 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	m.setFormat(format)
+	return nil
 }
 
 func (m *kvMeta) cacheACLs(ctx Context) error {

@@ -372,10 +372,6 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(format, "", "")
-	if err != nil {
-		return fmt.Errorf("json: %s", err)
-	}
 	ts := time.Now().Unix()
 	attr := &Attr{
 		Typ:    TypeDirectory,
@@ -392,7 +388,26 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 			return err
 		}
 	}
-	if err = m.rdb.Set(ctx, m.setting(), data, 0).Err(); err != nil {
+	// the versions are kept against the stored format in the same transaction
+	err = m.txn(ctx, func(tx *redis.Tx) error {
+		stored, err := tx.Get(ctx, m.setting()).Bytes()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+		if err = format.keepVersions(stored); err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(format, "", "")
+		if err != nil {
+			return fmt.Errorf("json: %s", err)
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, m.setting(), data, 0)
+			return nil
+		})
+		return err
+	}, m.setting())
+	if err != nil {
 		return err
 	}
 	m.setFormat(format)

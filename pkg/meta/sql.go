@@ -666,12 +666,6 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(format, "", "")
-	if err != nil {
-		return fmt.Errorf("json: %s", err)
-	}
-
-	m.setFormat(format)
 	n := &node{
 		Type:   TypeDirectory,
 		Nlink:  2,
@@ -682,7 +676,20 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 	n.setAtime(now)
 	n.setMtime(now)
 	n.setCtime(now)
-	return m.txn(func(s *xorm.Session) error {
+	err = m.txn(func(s *xorm.Session) error {
+		// the versions are kept against the stored format in the same transaction
+		stored := setting{Name: "format"}
+		ok, err := s.ForUpdate().Get(&stored)
+		if err != nil {
+			return err
+		}
+		if err = format.keepVersions([]byte(stored.Value)); err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(format, "", "")
+		if err != nil {
+			return fmt.Errorf("json: %s", err)
+		}
 		if format.TrashDays > 0 {
 			ok2, err := s.ForUpdate().Get(&node{Inode: TrashInode})
 			if err != nil {
@@ -720,6 +727,11 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 		}
 		return mustInsert(s, n, &cs)
 	})
+	if err != nil {
+		return err
+	}
+	m.setFormat(format)
+	return nil
 }
 
 func (m *dbMeta) cacheACLs(ctx Context) error {
