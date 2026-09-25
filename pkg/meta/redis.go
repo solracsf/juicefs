@@ -3072,6 +3072,12 @@ func (m *redisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 			return err
 		}
 		m.parseAttr(a, &attr)
+		if attr.Flags&FlagSnapshot != 0 {
+			// re-checked fresh in this transaction: still part of a snapshot as
+			// of right now, so never sweep it even if some earlier, unlocked scan
+			// thought it looked dangling
+			return nil
+		}
 		newSpace = -align4K(attr.Length)
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.ZAdd(ctx, m.delfiles(), redis.Z{Score: float64(time.Now().Unix()), Member: m.toDelete(inode, attr.Length)})
@@ -3899,6 +3905,29 @@ func (m *redisMeta) cleanupLeakedInodes(delete bool) {
 	cutoff := time.Now().Add(time.Hour * -1)
 	prefix := len(m.prefix)
 
+	// a detached tree -- a snapshot under construction, or an in-flight
+	// `juicefs clone` -- has no entry from anywhere yet, so its inodes would
+	// otherwise never turn up as found. Protect it and everything under it
+	// explicitly, before scanning for what the rest of the tree references.
+	for _, root := range m.doFindDetachedNodes(time.Now().Add(24 * time.Hour)) {
+		foundInodes[root] = struct{}{}
+		var walk func(Ino)
+		walk = func(ino Ino) {
+			var entries []*Entry
+			if eno := m.doReaddir(ctx, ino, 0, &entries, 0); eno != 0 && eno != syscall.ENOENT {
+				logger.Warnf("readdir detached node %d: %s", ino, eno)
+				return
+			}
+			for _, e := range entries {
+				foundInodes[e.Inode] = struct{}{}
+				if e.Attr.Typ == TypeDirectory {
+					walk(e.Inode)
+				}
+			}
+		}
+		walk(root)
+	}
+
 	_ = m.scan(ctx, "d[0-9]*", func(keys []string) error {
 		for _, key := range keys {
 			ino, _ := strconv.Atoi(key[prefix+1:])
@@ -3930,6 +3959,13 @@ func (m *redisMeta) cleanupLeakedInodes(delete bool) {
 			if Ino(ino).IsSnapshot() {
 				// snapshot roots are reached by name from Lookup, not by a directory
 				// entry, so the scan above never finds them and they are not leaked
+				continue
+			}
+			if attr.Flags&FlagSnapshot != 0 {
+				// a copy inside a snapshot, published or still under construction:
+				// it carries the ctime of what it copied, which the scans above may
+				// not have caught up with yet, and could be old enough on its own
+				// to look dangling
 				continue
 			}
 			if _, ok := foundInodes[Ino(ino)]; !ok && time.Unix(attr.Ctime, 0).Before(cutoff) {

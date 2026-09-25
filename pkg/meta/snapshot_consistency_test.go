@@ -250,3 +250,103 @@ func TestSnapshotSkipDirMtime(t *testing.T) {
 		}
 	})
 }
+
+// dropInode removes the attributes of an inode behind the client's back,
+// leaving whatever named it dangling -- the way a wrongly-swept leaked inode
+// or other metadata corruption would.
+func dropInode(t *testing.T, m Meta, ino Ino) {
+	var err error
+	switch c := m.(type) {
+	case *redisMeta:
+		err = c.rdb.Del(Background(), c.inodeKey(ino)).Err()
+	case *dbMeta:
+		_, err = c.db.Delete(&node{Inode: ino})
+	case *kvMeta:
+		err = c.deleteKeys(c.inodeKey(ino))
+	default:
+		t.Fatalf("unknown engine %T", m)
+	}
+	if err != nil {
+		t.Fatalf("drop inode %d: %s", ino, err)
+	}
+}
+
+// TestSnapshotLeakedSweepVsBuild checks that the Redis sweep of leaked inodes
+// leaves a snapshot under construction alone, even though its inodes carry the
+// old ctime of what they copy and are not yet named under .snapshots.
+func TestSnapshotLeakedSweepVsBuild(t *testing.T) {
+	forSnapshotClients(t, func(t *testing.T, m Meta) {
+		rm, ok := m.(*redisMeta)
+		if !ok {
+			t.Skip("the sweep under test is specific to Redis")
+		}
+		ctx := Background()
+		dir := snapshotMkdir(t, m, RootInode, "d")
+		var inodes []Ino
+		for i := 0; i < 10; i++ {
+			sub := snapshotMkdir(t, m, dir, fmt.Sprintf("sub%d", i))
+			inodes = append(inodes, sub)
+			for j := 0; j < 20; j++ {
+				inodes = append(inodes, snapshotCreate(t, m, sub, fmt.Sprintf("f%d", j)))
+			}
+		}
+		// age the source tree well past the sweep's one-hour cutoff, as a tree
+		// worth snapshotting usually is
+		old := time.Now().Add(-48 * time.Hour).Unix()
+		for _, ino := range inodes {
+			var a Attr
+			if st := rm.doGetAttr(ctx, ino, &a); st != 0 {
+				t.Fatalf("getattr: %s", st)
+			}
+			a.Ctime = old
+			if err := rm.rdb.Set(ctx, rm.inodeKey(ino), rm.marshal(&a), 0).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for round := 0; round < 5; round++ {
+			name := fmt.Sprintf("s%d", round)
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						rm.cleanupLeakedInodes(true)
+					}
+				}
+			}()
+			root, st := m.CreateSnapshot(ctx, dir, name, false, nil, nil)
+			close(stop)
+			wg.Wait()
+			if st != 0 {
+				t.Fatalf("round %d: snapshot: %s", round, st)
+			}
+			var broken int
+			var walk func(Ino)
+			walk = func(ino Ino) {
+				var es []*Entry
+				if st := rm.doReaddir(ctx, ino, 0, &es, -1); st != 0 {
+					t.Fatalf("readdir %d: %s", ino, st)
+				}
+				for _, e := range es {
+					var a Attr
+					if st := rm.doGetAttr(ctx, e.Inode, &a); st != 0 {
+						broken++
+						continue
+					}
+					if a.Typ == TypeDirectory {
+						walk(e.Inode)
+					}
+				}
+			}
+			walk(root)
+			if broken > 0 {
+				t.Fatalf("round %d: the concurrent sweep deleted %d inodes of snapshot %s while it was built", round, broken, name)
+			}
+		}
+	})
+}
