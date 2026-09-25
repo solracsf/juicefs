@@ -2547,6 +2547,16 @@ func (m *baseMeta) countDirNlink(ctx Context, inode Ino) (uint32, syscall.Errno)
 	return dirCounter, 0
 }
 
+// frozenUnder reports whether a node whose parent is parent belongs to a
+// snapshot: parent is the hidden snapshot root, a snapshot root, or frozen itself.
+func (m *baseMeta) frozenUnder(ctx Context, parent Ino) bool {
+	if parent.IsSnapshot() {
+		return true
+	}
+	var attr Attr
+	return m.en.doGetAttr(ctx, parent, &attr) == 0 && attr.Flags&FlagSnapshot != 0
+}
+
 type metaWalkFunc func(ctx Context, inode Ino, p string, attr *Attr)
 
 func (m *baseMeta) walk(ctx Context, inode Ino, p string, attr *Attr, walkFn metaWalkFunc) syscall.Errno {
@@ -2764,6 +2774,10 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 							attr.Mtime = now
 							attr.Ctime = now
 							attr.Length = 4 << 10
+							// a directory rebuilt inside a snapshot stays frozen
+							if m.frozenUnder(ctx, attr.Parent) {
+								attr.Flags |= FlagSnapshot | FlagImmutable
+							}
 						}
 						if st1 := m.en.doRepair(ctx, inode, attr, false); st1 == 0 || st1 == syscall.ENOENT {
 							logger.Debugf("Path %s (inode %d) is successfully repaired", path, inode)

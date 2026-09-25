@@ -352,3 +352,44 @@ func TestSnapshotRootFrozen(t *testing.T) {
 		}
 	}
 }
+
+// fsck --repair rebuilds a lost directory attribute inside a snapshot frozen.
+// The SQL engines cannot see an entry whose node is missing, so only the KV
+// and Redis engines exercise this path.
+func TestSnapshotFsckRepair(t *testing.T) {
+	for name, m := range snapshotFreezeMetas(t, nil, nil) {
+		ctx := Background()
+		root, ssub, _ := snapshotFreezeTree(t, m)
+		dropAttr := func(ino Ino) bool {
+			var err error
+			switch m := m.(type) {
+			case *redisMeta:
+				err = m.rdb.Del(ctx, m.inodeKey(ino)).Err()
+			case *kvMeta:
+				err = m.txn(ctx, func(tx *kvTxn) error {
+					tx.delete(m.inodeKey(ino))
+					return nil
+				})
+			default:
+				return false
+			}
+			if err != nil {
+				t.Fatalf("%s: drop attr of %d: %s", name, ino, err)
+			}
+			return true
+		}
+		for p, ino := range map[string]Ino{"/" + SnapshotName + "/s1/sub": ssub, "/" + SnapshotName + "/s1": root} {
+			if !dropAttr(ino) {
+				t.Logf("%s: an entry whose node is missing is invisible to fsck, skipped", name)
+				break
+			}
+			if err := m.Check(ctx, p, &CheckOpt{Repair: true, RepairDirMode: 0755}); err != nil {
+				t.Fatalf("%s: repair %s: %s", name, p, err)
+			}
+			got := rawAttr(t, m, ino)
+			if got.Flags&(FlagSnapshot|FlagImmutable) != FlagSnapshot|FlagImmutable {
+				t.Errorf("%s: repaired %s is not frozen: flags %d", name, p, got.Flags)
+			}
+		}
+	}
+}
