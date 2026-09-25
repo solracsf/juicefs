@@ -2410,8 +2410,12 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	return m.en.doRemoveXattr(ctx, inode, name)
 }
 
-// checkNotSnapshot refuses changes to an inode frozen by a snapshot.
+// checkNotSnapshot refuses changes to an inode frozen by a snapshot, and to the
+// hidden root that holds the snapshots.
 func (m *baseMeta) checkNotSnapshot(ctx Context, inode Ino) syscall.Errno {
+	if inode == SnapshotInode {
+		return syscall.EPERM
+	}
 	var attr Attr
 	if st := m.en.doGetAttr(ctx, inode, &attr); st != 0 {
 		return st
@@ -4465,10 +4469,11 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		dirtyAttr.Tier = attr.Tier
 		changed = true
 	}
-	// a snapshot is frozen for everyone, root included. FlagImmutable alone does
-	// not refuse attribute changes, and clearing it would let the data be rewritten.
-	// A change to nothing is not written, or it would stamp a new ctime
-	if cur.Flags&FlagSnapshot != 0 {
+	// a snapshot is frozen for everyone, root included, and so is the hidden root
+	// that holds them. FlagImmutable alone does not refuse attribute changes, and
+	// clearing it would let the data be rewritten. A change to nothing is not
+	// written, or it would stamp a new ctime
+	if cur.Flags&FlagSnapshot != 0 || inode == SnapshotInode {
 		if dirtyAttr != *cur {
 			return nil, syscall.EPERM
 		}

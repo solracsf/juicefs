@@ -309,3 +309,46 @@ func TestSnapshotNoopSetAttr(t *testing.T) {
 		}
 	}
 }
+
+// The hidden snapshot root is frozen like its snapshots, while snapshots can
+// still be attached to and detached from it.
+func TestSnapshotRootFrozen(t *testing.T) {
+	for name, m := range snapshotFreezeMetas(t, nil, nil) {
+		ctx := Background()
+		snapshotFreezeTree(t, m)
+		before := rawAttr(t, m, SnapshotInode)
+		set := func(set uint16, attr Attr) syscall.Errno { return m.SetAttr(ctx, SnapshotInode, set, 0, &attr) }
+		cases := map[string]func() syscall.Errno{
+			"chmod":    func() syscall.Errno { return set(SetAttrMode, Attr{Mode: 0}) },
+			"chown":    func() syscall.Errno { return set(SetAttrUID, Attr{Uid: 1000}) },
+			"chattr":   func() syscall.Errno { return set(SetAttrFlag, Attr{Flags: FlagImmutable}) },
+			"touch":    func() syscall.Errno { return set(SetAttrMtimeNow, Attr{}) },
+			"setxattr": func() syscall.Errno { return m.SetXattr(ctx, SnapshotInode, "user.x", []byte("y"), 0) },
+			"rmxattr":  func() syscall.Errno { return m.RemoveXattr(ctx, SnapshotInode, "user.x") },
+		}
+		for op, run := range cases {
+			if st := run(); st != syscall.EPERM {
+				t.Errorf("%s: %s on /%s should be EPERM, got %v", name, op, SnapshotName, st)
+			}
+		}
+		if st := set(SetAttrMode, Attr{Mode: before.Mode}); st != 0 {
+			t.Errorf("%s: no-op chmod on /%s: %v", name, SnapshotName, st)
+		}
+		if after := rawAttr(t, m, SnapshotInode); after != before {
+			t.Errorf("%s: /%s changed: %+v -> %+v", name, SnapshotName, before, after)
+		}
+		var src Ino
+		if st := m.Lookup(ctx, RootInode, "src", &src, &Attr{}, false); st != 0 {
+			t.Fatalf("%s: lookup src: %s", name, st)
+		}
+		if _, st := m.CreateSnapshot(ctx, src, "s2", true, nil, nil); st != 0 {
+			t.Errorf("%s: snapshot after the refused changes: %v", name, st)
+		}
+		if st := m.DeleteSnapshot(ctx, "s2", nil); st != 0 {
+			t.Errorf("%s: delete snapshot: %v", name, st)
+		}
+		if got := rawAttr(t, m, SnapshotInode); got.Nlink != before.Nlink {
+			t.Errorf("%s: nlink of /%s after attach and detach: %d != %d", name, SnapshotName, got.Nlink, before.Nlink)
+		}
+	}
+}
