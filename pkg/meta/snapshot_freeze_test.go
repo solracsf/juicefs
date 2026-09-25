@@ -241,3 +241,44 @@ func TestSnapshotFlagRaise(t *testing.T) {
 		}
 	}
 }
+
+// Creating inside a snapshot is refused with EPERM at every level, while a
+// directory in the trash still answers ENOENT.
+func TestSnapshotCreateInside(t *testing.T) {
+	format := testFormat()
+	format.TrashDays = 1
+	for name, m := range snapshotFreezeMetas(t, nil, format) {
+		ctx := Background()
+		root, ssub, _ := snapshotFreezeTree(t, m)
+		var live, trashed Ino
+		if st := m.Create(ctx, RootInode, "live", 0644, 0, 0, &live, &Attr{}); st != 0 {
+			t.Fatalf("%s: create: %s", name, st)
+		}
+		if st := m.Mkdir(ctx, RootInode, "td", 0755, 0, 0, &trashed, &Attr{}); st != 0 {
+			t.Fatalf("%s: mkdir: %s", name, st)
+		}
+		if st := m.Rmdir(ctx, RootInode, "td"); st != 0 {
+			t.Fatalf("%s: rmdir: %s", name, st)
+		}
+		if !rawAttr(t, m, trashed).Parent.IsTrash() {
+			t.Fatalf("%s: td is not in the trash", name)
+		}
+		ops := map[string]func(parent Ino) syscall.Errno{
+			"mknod":   func(p Ino) syscall.Errno { return m.Mknod(ctx, p, "n", TypeFile, 0644, 0, 0, "", new(Ino), &Attr{}) },
+			"mkdir":   func(p Ino) syscall.Errno { return m.Mkdir(ctx, p, "n", 0755, 0, 0, new(Ino), &Attr{}) },
+			"symlink": func(p Ino) syscall.Errno { return m.Symlink(ctx, p, "n", "/", new(Ino), &Attr{}) },
+			"link":    func(p Ino) syscall.Errno { return m.Link(ctx, live, p, "n", &Attr{}) },
+			"rename":  func(p Ino) syscall.Errno { return m.Rename(ctx, RootInode, "live", p, "n", 0, new(Ino), &Attr{}) },
+		}
+		for op, run := range ops {
+			for _, parent := range []Ino{root, ssub} {
+				if st := run(parent); st != syscall.EPERM {
+					t.Errorf("%s: %s under snapshot dir %d should be EPERM, got %v", name, op, parent, st)
+				}
+			}
+			if st := run(trashed); st != syscall.ENOENT {
+				t.Errorf("%s: %s under a trashed dir should stay ENOENT, got %v", name, op, st)
+			}
+		}
+	}
+}

@@ -3729,6 +3729,13 @@ func cloneFlags(flags, cmode uint8) uint8 {
 	return flags
 }
 
+// trashed reports whether a node whose parent is p was moved into the trash: p
+// is then one of the dated directories under the trash root. Snapshot roots
+// lie above the trash range, and what they hold is refused as immutable.
+func trashed(p Ino) bool {
+	return p > TrashInode && p < SnapshotInode
+}
+
 func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	if !m.toTrash(parent) {
 		return 0
