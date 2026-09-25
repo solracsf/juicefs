@@ -914,6 +914,14 @@ func (fs *FileSystem) lookup(ctx meta.Context, parent Ino, name string, inode *I
 	return err
 }
 
+// underHiddenRoot reports whether p leads into the trash or the snapshots. Those
+// roots have no directory entry, so the fast resolve of the Redis engine, which
+// walks entries, does not find them and returns ENOENT rather than ENOTSUP.
+func underHiddenRoot(p string) bool {
+	first, _, _ := strings.Cut(strings.TrimLeft(p, "/"), "/")
+	return first == meta.TrashName || first == meta.SnapshotName
+}
+
 func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool) (fi *FileStat, err syscall.Errno) {
 	return fs.doResolve(ctx, p, followLastSymlink, make(map[Ino]struct{}))
 }
@@ -945,7 +953,7 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 	var inode Ino
 	var attr = &Attr{}
 
-	if fs.conf.FastResolve {
+	if fs.conf.FastResolve && !underHiddenRoot(p) {
 		err = fs.m.Resolve(ctx, 1, p, &inode, attr, false)
 		if err == 0 {
 			fi = AttrToFileInfo(inode, attr)

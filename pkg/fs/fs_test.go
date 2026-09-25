@@ -19,8 +19,10 @@ package fs
 import (
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -380,7 +382,10 @@ func TestResolveRelativeSymlinkAfterRedirection(t *testing.T) {
 }
 
 func createTestFS(t testing.TB) *FileSystem {
-	m := meta.NewClient("memkv://", nil)
+	return createTestFSWith(t, meta.NewClient("memkv://", nil), false)
+}
+
+func createTestFSWith(t testing.TB, m meta.Meta, fastResolve bool) *FileSystem {
 	format := &meta.Format{
 		Name:      "test",
 		BlockSize: 4096,
@@ -400,6 +405,7 @@ func createTestFS(t testing.TB) *FileSystem {
 		EntryTimeout:    time.Millisecond * 100,
 		AttrTimeout:     time.Millisecond * 100,
 		AccessLog:       filepath.Join(t.TempDir(), "juicefs.access.log"),
+		FastResolve:     fastResolve,
 	}
 	objStore, _ := object.CreateStorage("mem", "", "", "", "")
 	store := chunk.NewCachedStore(objStore, *conf.Chunk, nil)
@@ -411,4 +417,59 @@ func createTestFS(t testing.TB) *FileSystem {
 	jfs.rotateAccessLog = 500
 	t.Cleanup(func() { _ = jfs.Close() })
 	return jfs
+}
+
+// entryResolver stands in for the fast resolve of the Redis engine, which walks
+// directory entries only: the hidden roots have none, so they are ENOENT to it.
+type entryResolver struct {
+	meta.Meta
+}
+
+func (m *entryResolver) Resolve(ctx meta.Context, parent meta.Ino, p string, inode *meta.Ino, attr *meta.Attr, force bool) syscall.Errno {
+	if force {
+		return m.Meta.Resolve(ctx, parent, p, inode, attr, force)
+	}
+	first, _, _ := strings.Cut(strings.TrimLeft(p, "/"), "/")
+	if first == meta.TrashName || first == meta.SnapshotName {
+		return syscall.ENOENT
+	}
+	return syscall.ENOTSUP
+}
+
+// A path into the snapshots, or the trash, is resolved by the fallback that looks
+// the path up entry by entry, since a fast resolve cannot see the hidden roots.
+func TestFastResolveHiddenRoots(t *testing.T) {
+	m := &entryResolver{meta.NewClient("memkv://", nil)}
+	jfs := createTestFSWith(t, m, true)
+	ctx := meta.NewContext(0, 0, []uint32{0})
+	if err := jfs.Mkdir(ctx, "/src", 0755, 0); err != 0 {
+		t.Fatalf("mkdir /src: %s", err)
+	}
+	f, err := jfs.Create(ctx, "/src/f", 0644, 0)
+	if err != 0 {
+		t.Fatalf("create /src/f: %s", err)
+	}
+	_ = f.Close(ctx)
+	var src meta.Ino
+	if st := m.Lookup(meta.Background(), meta.RootInode, "src", &src, &meta.Attr{}, false); st != 0 {
+		t.Fatalf("lookup src: %s", st)
+	}
+	if _, st := m.CreateSnapshot(meta.Background(), src, "s", false, nil, nil); st != 0 {
+		t.Fatalf("create snapshot: %s", st)
+	}
+	for _, p := range []string{"/" + meta.SnapshotName, "/" + meta.SnapshotName + "/s", "/" + meta.SnapshotName + "/s/f"} {
+		fi, err := jfs.Stat(ctx, p)
+		if err != 0 {
+			t.Fatalf("stat %s: %s", p, err)
+		}
+		if fi.name != path.Base(p) {
+			t.Fatalf("stat %s: name %q", p, fi.name)
+		}
+	}
+	if _, err := jfs.Stat(ctx, "/"+meta.TrashName); err != 0 {
+		t.Fatalf("stat /%s: %s", meta.TrashName, err)
+	}
+	if fi, err := jfs.Stat(ctx, "/src/f"); err != 0 || fi.name != "f" {
+		t.Fatalf("stat /src/f: %v %s", fi, err)
+	}
 }
