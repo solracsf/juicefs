@@ -1,0 +1,32 @@
+feat(meta,cmd): hold snapshots against deletion
+
+A hold, named by a tag like a ZFS user hold, keeps a snapshot until it is
+released, so a backup or a transfer reading it cannot lose it: juicefs
+snapshot hold and release, holds shown by list, and delete refused with
+EBUSY while any is left.
+
+A hold is an extended attribute under a reserved prefix on the snapshot
+root, so it survives restarts, gc, dump and load. Taking or releasing
+one checks in its transaction that the snapshot is still there, and
+detaching a snapshot checks for holds in its own: the two lock the same
+row on SQL, watch the same keys on Redis, and write the same entry key
+on KV engines, so a hold racing a delete either stops it or fails. SQL
+matches the prefix in Go, exact case, since LIKE ignores case on SQLite
+and MySQL's default collation. The prefix cannot be set or removed as an
+attribute, is hidden from listxattr and getxattr, and holding or
+releasing leaves the root's attributes and ctime alone; copies of a held
+snapshot drop its holds, and validation ignores them. Tags are 1 to 200
+bytes of UTF-8 without control characters.
+
+The same path records when a snapshot was taken, in a reserved
+attribute set once CreateSnapshot has attached it, which list reports:
+the root's ctime is copied from the source and validated against it, so
+it is not the creation time. A snapshot from before this falls back to
+its ctime.
+
+The race test runs across two clients where the engine allows one, since
+within one client both calls take the same in-process lock. Removing each
+engine's safeguard in turn (the Redis watch, the SQL row lock, the KV
+entry rewrite, FoundationDB's read tracking) makes it fail.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

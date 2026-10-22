@@ -1,0 +1,20 @@
+feat(meta): keep snapshots through gc, compaction, dump and load
+
+- The Redis leaked-inode sweep leaves snapshot roots alone, which have no
+  directory entry by design, and the inodes of a snapshot being built,
+  which carry the old ctime of what they copy and may not be named yet.
+- Compaction skips FlagSnapshot inodes: reading a snapshot schedules it
+  like any file, and merging its slices would rewrite what it captured.
+  The check runs after the cheap structural tests, so it costs a read
+  only when a compaction would otherwise go ahead.
+- The JSON dump writes the hidden root as a third "Snapshots" section,
+  from the fast and normal paths of every engine, and the loader rebuilds
+  nextSnapshot from the snapshot roots. A client that predates this
+  ignores the section. The protobuf backup saves nextSnapshot, which it
+  lacked, so a restore cannot hand out the inode of an existing
+  snapshot, and keeps snapshot roots out of nextTrash.
+- A dump whose --subdir points into /.snapshots is refused before
+  anything is written: loaded, its frozen entries could never be changed
+  or emptied. Clone the snapshot into a live directory and dump that.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

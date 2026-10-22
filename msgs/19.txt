@@ -1,0 +1,33 @@
+feat(meta,cmd): take snapshots at one instant
+
+Copied entry by entry while clients write, a snapshot could hold a
+change without an earlier one it depended on, or a renamed file twice.
+After the copy, the snapshot is compared with the live tree: entries,
+attributes and extended attributes, through a new engine call that reads
+all of an inode's attributes at once. Every entry was copied before the
+comparison began and found unchanged after, so the copy is the tree at
+one instant between the two passes. A difference discards the copy and
+takes it again, up to three times, then create fails with EBUSY.
+
+ctime is the change signal: every data write, truncate, attribute change
+and rename moves it, and the listing comparison catches entries added or
+removed. Access times and link counts are not compared. --best-effort
+keeps the first copy whatever changed during it.
+
+Matching mtime and ctime do not prove a directory's entries unchanged:
+SkipDirMtime lets a client leave both alone for a while after an entry
+change, and a change reverted inside that window moves neither. Each
+session now records its SkipDirMtime, and a consistent build notes when
+it listed each directory for the copy. The comparison trusts a directory
+only if that listing came at least a window after its times, the window
+being the largest SkipDirMtime on the volume, never below the default,
+as the engine applies it; one listed sooner counts as changed. Before
+trying again, create waits out that window, capped at what the default
+gives the engine, so a directory touched just before an attempt is not
+distrusted again at once.
+
+The snapshot counter can trail the snapshots a load by an unaware client
+brought back, so a snapshot root whose inode is already taken is skipped
+rather than written over.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

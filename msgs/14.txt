@@ -1,0 +1,16 @@
+feat(vfs): serve and list /.snapshots
+
+Snapshot roots live above minInternalNode, so IsSpecialNode excludes
+their range: otherwise the VFS treats them as internal files, and
+getxattr, listxattr, flock, locks and ioctl fail on them.
+
+.snapshots appears in the root listing like .trash, once the first
+snapshot has created it and only on a mount of the whole volume, where
+the name resolves. HideInternal hides it and PrefixInternal renames it
+to .jfs.snapshots, as for .trash.
+
+A path into a hidden root is looked up entry by entry even with fast
+resolve on: the fast resolve of the Redis engine, used by the Java SDK,
+walks directory entries in a Lua script, and the hidden roots have none.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

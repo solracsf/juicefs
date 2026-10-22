@@ -1,0 +1,29 @@
+feat(meta,cmd): create and list snapshots
+
+CreateSnapshot freezes a copy of a directory tree under .snapshots/<name>.
+Only metadata is written: the copy shares every slice with the original,
+so a snapshot costs inodes but no object storage.
+
+The copy reuses the clone machinery. CLONE_MODE_SNAPSHOT stamps
+FlagSnapshot and FlagImmutable on each inode as it is copied, and lets
+the copy fill directories it has just frozen. Clone accepts only the
+public modes, so the clone control file cannot leave a frozen copy in
+the live tree; CreateSnapshot reaches cloneEntry directly. The root comes
+from the reserved range through a nextSnapshot counter. The tree is
+built detached and attached under .snapshots as the last step, so an
+interrupted snapshot is reaped by the background cleanup instead of
+being left half visible. Listing is a readdir of the hidden root.
+
+juicefs snapshot create and list follow the shape of juicefs quota. The
+minimum version is 1.5.0-dev, since CompareVersions orders a pre-release
+before its release. Each subcommand defines the flags it takes, and
+reorderOptions places the flags of a subcommand after its name, so a
+flag given to the wrong subcommand is refused instead of ignored.
+
+Only live state is a source: an inode from the reserved range or one
+carrying FlagSnapshot is refused with EPERM, so no path, hard link or
+subdirectory mount leads a snapshot into another. Names longer than
+MaxName are refused with ENAMETOOLONG, and names holding control
+characters, which would break the listing, with EINVAL.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

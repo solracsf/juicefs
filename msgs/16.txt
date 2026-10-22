@@ -1,0 +1,22 @@
+feat(meta,cmd): delete snapshots
+
+DeleteSnapshot detaches the root with doDetachDirNode, which drops the
+entry and registers the root as detached in one transaction, at time 0,
+so gc reaps it at once if the delete dies there. The tree is then removed
+under the ignore-flags marker, and the call waits for the file data
+removals it started: for a client without a session, as the CLI is, the
+slices only the snapshot held are released before it returns, while a
+client with a session only queues them for a later gc. Concurrent
+deletes in one process take turns on that wait instead of deadlocking
+over its slots. Snapshots were never charged, so a withoutUsage marker
+makes their removal credit nothing, in every engine and in the
+detached-node reaper. juicefs snapshot delete wires the object store
+like gc does, and fails when some data could not be removed, pointing
+to gc, which reclaims it.
+
+A build that outlasts gc's one-day threshold for detached trees would be
+reaped while still being written, so CreateSnapshot refreshes its
+timestamp every hour through doTouchDetachedNode, which only updates an
+entry that still exists.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

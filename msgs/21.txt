@@ -1,0 +1,11 @@
+feat(meta): check snapshots in fsck of the whole volume
+
+No entry of the root names .snapshots, so fsck --path / --recursive
+never reached snapshot data and an object a snapshot lost went
+unnoticed. It now walks the hidden root too. Its usage stat is not
+checked, since snapshots are exempt from usage. fsck --repair rebuilds
+a lost directory under the hidden root, a snapshot root or a frozen
+directory with FlagSnapshot and FlagImmutable, so a repair never
+unfreezes part of a snapshot.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

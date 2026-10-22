@@ -1,0 +1,11 @@
+feat(meta,cmd): cap the number of snapshots a volume holds
+
+Snapshots cost inodes and are exempt from quotas, so a MaxSnapshots
+format setting, 0 for unlimited, set with juicefs format or config
+--max-snapshots, bounds how much metadata they add. Both refuse a
+negative value. The count is the nlink of the hidden root.
+CreateSnapshot checks it before copying, and each engine checks it
+again in the attach transaction, so two creates racing at the limit
+cannot both pass.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

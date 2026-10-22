@@ -1,0 +1,36 @@
+feat(meta): reserve an inode range and a hidden root for snapshots
+
+Groundwork for snapshots; nothing allocates in the range or sets the flag
+yet.
+
+- SnapshotInode bounds the trash range from above and starts a range
+  reserved for snapshot roots, with IsSnapshot(). The 39 IsTrash() call
+  sites keep their meaning. The subTrash guard and the engines' test for
+  a dated trash directory gain the upper bound, so a runaway nextTrash
+  counter cannot hand out snapshot inodes and the first level of a
+  snapshot is never taken for the trash.
+- FlagSnapshot marks inodes that belong to a snapshot. mergeAttr refuses
+  flag changes on them, root included: SetAttrFlag replaces the flag byte
+  wholesale, so FlagImmutable alone could simply be cleared.
+- .snapshots under the volume root resolves in Lookup to SnapshotInode,
+  with no directory entry, like .trash. It is created on first use, so a
+  volume that never snapshots carries nothing extra. The name cannot be
+  created, linked, renamed or removed, and nothing can be made or cloned
+  inside it by hand. isReservedEntry reserves both spellings of each
+  hidden root, plain and with the .jfs prefix of --prefix-internal: a
+  mount resolves only its own spelling, so an entry made under the other
+  would shadow or double the hidden root. .snapshots is reserved at the
+  root of the volume only, not at the root of a subdirectory mount; the
+  trash keeps its checks at the root of every mount.
+- Everything that finds the trash root by hand learns the new one too:
+  the Redis leaked-inode sweep, GetPaths and GetParents, the dump
+  loader's counters, BatchUnlink's guard, and Link, which would otherwise
+  give frozen content a mutable path. A clone taken out of a snapshot
+  drops the freeze.
+- A load by a client unaware of the range counts snapshot inodes as
+  trash and can leave the trash counter past the range. Each engine
+  checks the counter in the transaction that creates an hourly trash
+  directory and, when it is out of range, starts it over from the
+  highest trash directory there is.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

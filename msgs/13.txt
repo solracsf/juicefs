@@ -1,0 +1,13 @@
+feat(meta): refuse attribute and xattr changes on snapshot inodes
+
+FlagImmutable refuses data writes and removal, but not chmod, chown,
+utimes or extended attribute changes. mergeAttr now refuses any real
+change to a FlagSnapshot inode, root included, and SetXattr and
+RemoveXattr check the flag first. A setattr that changes nothing is
+still accepted, and writes nothing. The hidden /.snapshots root, created
+without flags, refuses the same changes, while attaching and detaching
+snapshots still update it. SetAttr cannot raise FlagSnapshot, which
+could never be cleared again: only CreateSnapshot freezes an inode. The
+flags a clone carries come from one cloneFlags helper in every engine.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

@@ -1,0 +1,22 @@
+fix(meta): make emptyDir terminate when an entry's inode is already gone
+
+emptyDir recurses into each directory entry before removing it. When a
+child's own inode row is already gone but the parent's link to it is
+not -- metadata corruption, however it arose, e.g. a leaked-inode sweep
+racing a clone -- the recursive emptyDir call returns ENOENT, which the
+caller's guard (`if st == 0`) takes to mean nothing more to do, so it
+never even attempts the Rmdir/BatchUnlink that would clear the dangling
+link. The entry survives the pass, the next pass lists it again, and
+emptyDir loops forever.
+
+Track whether a pass actually removed anything; a pass that removes
+nothing while entries remain can only be repeating the same failure
+forever, since neither BatchUnlink nor Rmdir can succeed on a link
+whose target is already gone, so return ENOENT instead of looping.
+
+Regression test: TestEmptyDirDanglingEntry, which removes a tree whose
+subdirectory lost its inode on Redis, SQLite, MemKV and Badger; without
+the fix the removal never returns, and the test bounds it with a
+timeout.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

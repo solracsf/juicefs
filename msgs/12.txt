@@ -1,0 +1,18 @@
+feat(meta,cmd): exempt snapshots from capacity and quotas
+
+Charging a snapshot against the volume capacity and the directory,
+user and group quotas would stop a volume more than half full from
+taking a whole-volume snapshot and double df after one, and every
+recount walks from the root, never reaches .snapshots, and would drop
+the charge again. So snapshot clone mode skips the stat, quota and
+user/group updates, and the JSON and protobuf loaders leave FlagSnapshot
+inodes out of the usage they rebuild. A directory quota on the snapshot
+root, a snapshot or anything inside one is refused, as one on the trash
+is.
+
+snapshot list reports the usage instead: inodes and size per snapshot
+and a total. Each snapshot directory resyncs its dir stat from what was
+copied, since the row copied from the source can lag behind its
+buffered updates and would be frozen wrong.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

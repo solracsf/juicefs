@@ -1,0 +1,41 @@
+fix(meta): keep older clients off and an existing /.snapshots reachable
+
+A client without snapshot support would not honor the freeze, its gc
+would delete snapshot roots on Redis, and its JSON dump would drop them.
+A minimum client version cannot keep it off, since builds of the 1.5
+line from before snapshots report 1.5.0-dev too. So the first snapshot
+moves the volume from metadata version 1 to 2, SnapshotVersion: every
+client refuses a metadata version above the one it supports, at every
+command and whatever its release, and a mounted one leaves at its next
+refresh. New volumes stay at version 1, so a volume that never
+snapshots is what earlier clients format.
+
+The raise rewrites the stored format, never lowering the version, and
+then only the version of the in-memory copy, which a mount may hold with
+its secrets decrypted. The client warns when it raises the version,
+which stays raised even if the snapshot then fails. config and format
+keep the stored metadata and minimum client versions, read in the same
+transaction on every engine, so one started before a raise cannot lower
+it, and format may raise the metadata version without --force.
+
+Sessions record the metadata version their client supports. A snapshot
+is refused while a live session records a lower one, or none, which
+marks a build from before snapshots; expired sessions are left out, as
+their clients are gone.
+
+A real /.snapshots from before (snapper creates one on btrfs, and backups
+copy it) stays reachable: Lookup intercepts the name only once the hidden
+root exists, rmdir and rename-away are refused only then, and the root is
+not created while such an entry is there, which fails the snapshot with
+EEXIST and a message to rename it.
+
+A loader checks the settings of a JSON dump, or the format of a binary
+backup, before its first write, and refuses a metadata version it does
+not support. A dump read from a plain file is checked in a pass of its
+own, so one re-serialized with sorted keys, 'Setting' after the entries,
+still loads; one read from a stream that cannot be rewound must carry
+'Setting' first. A dump records the stored metadata version, which may
+be newer than the format its client loaded, and fails if the version
+rises while it runs, so a dump that holds a snapshot always carries it.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

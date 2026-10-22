@@ -1,0 +1,18 @@
+feat(meta): preserve hard links in snapshots
+
+A file with several names inside the snapshotted tree is copied once,
+the first time the snapshot meets it, and linked under its other names
+through a new engine call that adds the link without touching the frozen
+copy's flags or times, so the snapshot still compares equal to its
+source. Names outside the tree are not counted in the copy's link
+count.
+
+Whether a file is copied once and linked is decided from the link count
+in the listing, so a link made while the tree is copied can leave one
+file as two copies whose attributes both match it. The validation of a
+consistent snapshot now also checks hard-link identity: it records the
+copy behind every hard-linked name, on either side, and a file whose
+names ended up on two copies, or two files on one copy, counts as a
+change, so the snapshot is taken again.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>

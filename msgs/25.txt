@@ -1,0 +1,24 @@
+test(ci): battle-test snapshots with several clients and faults
+
+Several mounts write and read while snapshots are taken and deleted,
+with compaction and gc running. Every snapshot is checked against what
+the writers journaled, including that a consistent one is the tree at a
+single instant, then re-read from a fresh client after the live tree is
+gone. Adversaries move a file round three directories and cycle values
+in file contents and extended attributes, keeping invariants no real
+state breaks: a consistent snapshot must never break them, and
+best-effort copies must, or the adversary proved nothing.
+
+Creates and deletes are killed mid-way, clients are killed or frozen,
+the metadata engine is paused, kept busy and cut off, and each fault is
+checked to have landed. Also covers read-only enforcement, holds (crash,
+gc, forgery through a mount, the root unchanged by holds, racing
+deletes), dump and load, fsck, create and delete races, the snapshot
+limit and a 1.3 client.
+
+The command tests run when the workload changes, and the step is capped
+at 20 minutes. The old-client test downloads the 1.3 release with
+GITHUB_TOKEN when set, and fails in CI rather than skipping when it
+cannot.
+
+Signed-off-by: Git'Fellow <12234510+solracsf@users.noreply.github.com>
