@@ -1,5 +1,9 @@
 # JuiceFS snapshots: rebuild kit
 
+Start with NEXT-SESSION.md (state, decisions, first steps); the base decided
+on 2026-10-24 is upstream main at resume time, so read "9325fe3" below as
+"the chosen base".
+
 Everything needed to rebuild the snapshot branch, a second time, without
 rediscovering anything. The first rebuild (session of 2026-09-25) produced a
 green 27-commit history (tip 52f6bade) that lived only in a session scratchpad
